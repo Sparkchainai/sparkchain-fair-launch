@@ -1,0 +1,30 @@
+{
+  "timestamp": "2025-06-27T06:28:43.993Z",
+  "network": "https://api.devnet.solana.com",
+  "programId": "5FmNvJb7PpUtpfvK1iXkcBcKEDbsGQJb1s9MqWfwHyrV",
+  "authority": "2SQzXYd3zQppbKrLiHMG329hU8ttAzTZcpR3pgCP9LfJ",
+  "tokenMint": "CUVkMoBLvx8UPQANsL4FsTqNfZZgXWRTe69ZiMyWTRXJ",
+  "distributionState": "8cM1FT9DVrkyUF4apqQnAUcny8jsjgkTwbqrpFZbommP",
+  "tokenVault": "URRCcTZLfNqi55dbvfrWB5ptY5cZkNPUHo7yDXy1dBY",
+  "authorityTokenAccount": "9xq3bRWA6PqBZXsm5JjmYyUL92GXbzKDFf2tLXGiPiTF",
+  "tokenInfo": {
+    "name": "SPARK",
+    "symbol": "SPARK",
+    "decimals": 9,
+    "totalSupply": "1000000000000000000",
+    "mintAuthorityRemoved": true,
+    "freezeAuthority": null
+  },
+  "config": {
+    "totalTokenPool": "375000000000000000",
+    "commitEndTime": 1751610515,
+    "rate": 0.00000140625,
+    "targetRaiseSol": "1000000000",
+    "vaultFundingAmount": "375000000000000000"
+  },
+  "transactions": {
+    "initialize": "3oGNmBxrCW2QYa852JGX3XjxpXjWyC9Sx4wY2EPiKyuhi2C6bxZEXWZXdEUoXL87ceGXQsAuQicMhkuVtq4fEwRs",
+    "createVault": "4jWEcLtP6YzcbhMbiZtFcYH4cibnsPPGTtfXcd4EYLEFG5SwQmtHrhAt5YAKmUBiuBTkAxUtWjG1xH6NEkRLySnh",
+    "fundVault": "3fmk9pcoFXjKDYHGMmJZHYCs7cWwNDQu8LWzExC3oUSJPxqAASqaUZv5BuCzbzYjNLFx5XCwro8fJJmiG3UWbzmH"
+  }
+}

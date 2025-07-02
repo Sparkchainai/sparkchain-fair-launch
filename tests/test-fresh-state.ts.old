@@ -1,0 +1,195 @@
+import * as anchor from "@coral-xyz/anchor";
+import { Program, AnchorProvider } from "@coral-xyz/anchor";
+import { SparkChainTge } from "../target/types/spark_chain_tge";
+import {
+  Keypair,
+  PublicKey,
+  SystemProgram,
+  LAMPORTS_PER_SOL,
+  Connection,
+  Ed25519Program,
+  SYSVAR_INSTRUCTIONS_PUBKEY,
+} from "@solana/web3.js";
+import { BN } from "bn.js";
+import {
+  createMint,
+  getOrCreateAssociatedTokenAccount,
+  mintTo,
+  getAccount,
+} from "@solana/spl-token";
+import nacl from "tweetnacl";
+import { assert } from "chai";
+
+describe("spark_chain_tge - Fresh State Test", () => {
+  let provider: AnchorProvider;
+  let program: Program<SparkChainTge>;
+  let distributionAuthority: Keypair;
+  let backendSigner: nacl.SignKeyPair;
+  let user: Keypair;
+
+  const CONNECTION = new Connection(
+    "http://localhost:8899",
+    "confirmed"
+  );
+
+  before(async () => {
+    // Generate new keypairs
+    distributionAuthority = Keypair.generate();
+    user = Keypair.generate();
+    backendSigner = nacl.sign.keyPair();
+
+    // Airdrop SOL
+    const authAirdrop = await CONNECTION.requestAirdrop(
+      distributionAuthority.publicKey,
+      100 * LAMPORTS_PER_SOL
+    );
+    await CONNECTION.confirmTransaction(authAirdrop, "confirmed");
+
+    const userAirdrop = await CONNECTION.requestAirdrop(
+      user.publicKey,
+      10 * LAMPORTS_PER_SOL
+    );
+    await CONNECTION.confirmTransaction(userAirdrop, "confirmed");
+
+    // Setup provider
+    provider = new AnchorProvider(
+      CONNECTION,
+      new anchor.Wallet(distributionAuthority),
+      { commitment: "confirmed" }
+    );
+    anchor.setProvider(provider);
+
+    program = anchor.workspace.SparkChainTge as Program<SparkChainTge>;
+  });
+
+  it("Should create and use a fresh user commitment", async () => {
+    // First let's commit as a user without initializing distribution state
+    // We'll use the existing initialized state
+    const [distributionStatePDA] = PublicKey.findProgramAddressSync(
+      [Buffer.from("global_distribution_state")],
+      program.programId
+    );
+    const [backendAuthorityPDA] = PublicKey.findProgramAddressSync(
+      [Buffer.from("backend_authority")],
+      program.programId
+    );
+    const [tokenVaultPDA] = PublicKey.findProgramAddressSync(
+      [Buffer.from("token_vault"), distributionStatePDA.toBuffer()],
+      program.programId
+    );
+    
+    // Create a fresh user for this test
+    const freshUser = Keypair.generate();
+    const airdrop = await CONNECTION.requestAirdrop(
+      freshUser.publicKey,
+      10 * LAMPORTS_PER_SOL
+    );
+    await CONNECTION.confirmTransaction(airdrop, "confirmed");
+
+    // User commits resources
+    const points = new BN(100);
+    const solAmount = new BN(1 * LAMPORTS_PER_SOL);
+    const nonce = new BN(1000); // Use a high nonce to avoid conflicts
+    const expiry = new BN(Math.floor(Date.now() / 1000) + 60);
+    const [userCommitmentPDA] = PublicKey.findProgramAddressSync(
+      [Buffer.from("commitment"), freshUser.publicKey.toBuffer()],
+      program.programId
+    );
+
+    // Create proof message
+    const msg = Buffer.concat([
+      Buffer.from("POINTS_DEDUCTION_PROOF:"),
+      freshUser.publicKey.toBuffer(),
+      points.toBuffer("le", 8),
+      nonce.toBuffer("le", 8),
+      expiry.toBuffer("le", 8),
+    ]);
+    
+    // Get backend authority to get the backend pubkey
+    const backendAuth = await program.account.backendAuthority.fetch(backendAuthorityPDA);
+    const backendPubkey = backendAuth.backendPubkey;
+    
+    const proofSignature = nacl.sign.detached(msg, backendSigner.secretKey);
+
+    // Create Ed25519 instruction for signature verification
+    const ed25519Instruction = Ed25519Program.createInstructionWithPublicKey({
+      publicKey: backendPubkey.toBytes(),
+      message: msg,
+      signature: proofSignature,
+    });
+
+    try {
+      // First, let's simulate to get better error logs
+      const tx = await program.methods
+        .commitResources(points, solAmount, Array.from(proofSignature), nonce, expiry)
+        .accounts({
+          userCommitment: userCommitmentPDA,
+          backendAuthority: backendAuthorityPDA,
+          distributionState: distributionStatePDA,
+          user: freshUser.publicKey,
+          systemProgram: SystemProgram.programId,
+          instructions: SYSVAR_INSTRUCTIONS_PUBKEY,
+        })
+        .preInstructions([ed25519Instruction])
+        .signers([freshUser])
+        .transaction();
+      
+      // Set fee payer
+      tx.feePayer = freshUser.publicKey;
+      tx.recentBlockhash = (await provider.connection.getLatestBlockhash()).blockhash;
+      
+      // Sign and send transaction
+      tx.sign(freshUser);
+      const signature = await provider.connection.sendRawTransaction(tx.serialize(), {
+        skipPreflight: true,
+        commitment: "confirmed"
+      });
+      
+      // Wait for confirmation
+      const latestBlockhash = await provider.connection.getLatestBlockhash();
+      const result = await provider.connection.confirmTransaction({
+        signature,
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight
+      }, "confirmed");
+      
+      if (result.value.err) {
+        // Wait a bit for the transaction to be indexed
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        
+        const txDetails = await provider.connection.getTransaction(signature, {
+          commitment: "confirmed",
+          maxSupportedTransactionVersion: 0
+        });
+        console.error("Transaction failed with logs:", txDetails?.meta?.logMessages);
+        
+        // Also try to get parsed transaction for better error info
+        const parsedTx = await provider.connection.getParsedTransaction(signature, {
+          commitment: "confirmed",
+          maxSupportedTransactionVersion: 0
+        });
+        console.error("Parsed transaction:", JSON.stringify(parsedTx?.meta, null, 2));
+        
+        throw new Error(`Transaction failed: ${JSON.stringify(result.value.err)}`);
+      }
+      
+      const commitTx = signature;
+
+      console.log("Commit transaction:", commitTx);
+
+      // Verify commitment
+      const commitment = await program.account.userCommitment.fetch(userCommitmentPDA);
+      assert.equal(commitment.user.toString(), freshUser.publicKey.toString());
+      assert.equal(commitment.points.toString(), points.toString());
+      assert.equal(commitment.solAmount.toString(), solAmount.toString());
+      
+      console.log("✅ Fresh user commitment test passed!");
+    } catch (error: any) {
+      console.error("Error during commit:", error);
+      if (error.getLogs) {
+        console.error("Transaction logs:", await error.getLogs());
+      }
+      throw error;
+    }
+  });
+});

@@ -1,0 +1,817 @@
+import * as anchor from "@coral-xyz/anchor";
+import { Program, AnchorProvider } from "@coral-xyz/anchor";
+import { SparkChainTge } from "../target/types/spark_chain_tge";
+import {
+  Keypair,
+  PublicKey,
+  SystemProgram,
+  LAMPORTS_PER_SOL,
+  Connection,
+} from "@solana/web3.js";
+import { BN } from "bn.js";
+import {
+  createMint,
+  getOrCreateAssociatedTokenAccount,
+  mintTo,
+  getAccount,
+} from "@solana/spl-token";
+import nacl from "tweetnacl";
+import { assert } from "chai";
+
+describe("spark_chain_tge - Integration Tests", () => {
+  let provider: AnchorProvider;
+  let program: Program<SparkChainTge>;
+  let distributionAuthority: Keypair;
+  let backendSigner: nacl.SignKeyPair;
+  let backendAuthorityPDA: PublicKey;
+  let distributionStatePDA: PublicKey;
+  let tokenMint: PublicKey;
+  let tokenVaultPDA: PublicKey;
+
+  const CONNECTION = new Connection(
+    process.env.ANCHOR_PROVIDER_URL || "http://localhost:8899",
+    "confirmed"
+  );
+
+  const DISTRIBUTION_STATE_SEED = Buffer.from("global_distribution_state");
+  const BACKEND_AUTHORITY_SEED = Buffer.from("backend_authority");
+  const TOKEN_VAULT_SEED = Buffer.from("token_vault");
+  const USER_COMMITMENT_SEED = Buffer.from("commitment");
+
+  before(async () => {
+    distributionAuthority = Keypair.generate();
+    backendSigner = nacl.sign.keyPair();
+
+    await CONNECTION.requestAirdrop(
+      distributionAuthority.publicKey,
+      100 * LAMPORTS_PER_SOL
+    );
+    await CONNECTION.confirmTransaction(
+      await CONNECTION.requestAirdrop(distributionAuthority.publicKey, 100 * LAMPORTS_PER_SOL),
+      "confirmed"
+    );
+
+    provider = new AnchorProvider(
+      CONNECTION,
+      new anchor.Wallet(distributionAuthority),
+      { commitment: "confirmed" }
+    );
+    anchor.setProvider(provider);
+
+    program = anchor.workspace.SparkChainTge as Program<SparkChainTge>;
+  });
+
+  describe("Multi-User Scenarios", () => {
+    beforeEach(async () => {
+      // Fresh setup for each test
+      [distributionStatePDA] = PublicKey.findProgramAddressSync(
+        [DISTRIBUTION_STATE_SEED],
+        program.programId
+      );
+      [backendAuthorityPDA] = PublicKey.findProgramAddressSync(
+        [BACKEND_AUTHORITY_SEED],
+        program.programId
+      );
+      [tokenVaultPDA] = PublicKey.findProgramAddressSync(
+        [TOKEN_VAULT_SEED, distributionStatePDA.toBuffer()],
+        program.programId
+      );
+    });
+
+    it("Should handle multiple users committing and claiming fairly", async () => {
+      // Initialize
+      const commitEndTime = new BN(Math.floor(Date.now() / 1000) + 3600);
+      const rate = 1.0;
+      const targetRaise = new BN(1000 * LAMPORTS_PER_SOL);
+
+      await program.methods
+        .initialize(commitEndTime, rate, targetRaise)
+        .accounts({
+          distributionState: distributionStatePDA,
+          authority: distributionAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      const backendPubkey = new PublicKey(backendSigner.publicKey);
+      await program.methods
+        .initializeBackendAuthority(backendPubkey)
+        .accounts({
+          backendAuthority: backendAuthorityPDA,
+          authority: distributionAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      // Create token and fund vault
+      tokenMint = await createMint(
+        provider.connection,
+        distributionAuthority,
+        distributionAuthority.publicKey,
+        null,
+        9
+      );
+
+      await program.methods
+        .createTokenVault()
+        .accounts({
+          tokenVault: tokenVaultPDA,
+          distributionState: distributionStatePDA,
+          tokenMint: tokenMint,
+          authority: distributionAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+          tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      const authorityTokenAccount = await getOrCreateAssociatedTokenAccount(
+        provider.connection,
+        distributionAuthority,
+        tokenMint,
+        distributionAuthority.publicKey
+      );
+
+      const totalTokens = new BN(10_000_000_000); // 10 tokens with 9 decimals
+      await mintTo(
+        provider.connection,
+        distributionAuthority,
+        tokenMint,
+        authorityTokenAccount.address,
+        distributionAuthority,
+        totalTokens.toNumber()
+      );
+
+      await program.methods
+        .fundVault(totalTokens)
+        .accounts({
+          distributionState: distributionStatePDA,
+          authorityTokenAccount: authorityTokenAccount.address,
+          tokenVault: tokenVaultPDA,
+          authority: distributionAuthority.publicKey,
+          tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      // Create 5 users with different contributions
+      const users = [];
+      const contributions = [
+        { points: new BN(100), sol: new BN(1 * LAMPORTS_PER_SOL) },
+        { points: new BN(200), sol: new BN(2 * LAMPORTS_PER_SOL) },
+        { points: new BN(300), sol: new BN(3 * LAMPORTS_PER_SOL) },
+        { points: new BN(150), sol: new BN(1.5 * LAMPORTS_PER_SOL) },
+        { points: new BN(250), sol: new BN(2.5 * LAMPORTS_PER_SOL) },
+      ];
+
+      // Create and fund users
+      for (let i = 0; i < contributions.length; i++) {
+        const user = Keypair.generate();
+        await CONNECTION.requestAirdrop(user.publicKey, 20 * LAMPORTS_PER_SOL);
+        await CONNECTION.confirmTransaction(
+          await CONNECTION.requestAirdrop(user.publicKey, 20 * LAMPORTS_PER_SOL),
+          "confirmed"
+        );
+        users.push({ keypair: user, contribution: contributions[i] });
+      }
+
+      // All users commit
+      let nonceCounter = 1;
+      for (const { keypair, contribution } of users) {
+        const [userCommitmentPDA] = PublicKey.findProgramAddressSync(
+          [USER_COMMITMENT_SEED, keypair.publicKey.toBuffer()],
+          program.programId
+        );
+
+        const nonce = new BN(nonceCounter++);
+        const expiry = new BN(Math.floor(Date.now() / 1000) + 60);
+
+        const msg = Buffer.concat([
+          Buffer.from("POINTS_DEDUCTION_PROOF:"),
+          keypair.publicKey.toBuffer(),
+          contribution.points.toBuffer("le", 8),
+          nonce.toBuffer("le", 8),
+          expiry.toBuffer("le", 8),
+        ]);
+        const signature = nacl.sign.detached(msg, backendSigner.secretKey);
+
+        await program.methods
+          .commitResources(
+            contribution.points,
+            contribution.sol,
+            Array.from(signature),
+            nonce,
+            expiry
+          )
+          .accounts({
+            userCommitment: userCommitmentPDA,
+            backendAuthority: backendAuthorityPDA,
+            distributionState: distributionStatePDA,
+            user: keypair.publicKey,
+            systemProgram: SystemProgram.programId,
+          } as any)
+          .signers([keypair])
+          .rpc();
+      }
+
+      // Verify total score and raised SOL
+      const state = await program.account.distributionState.fetch(distributionStatePDA);
+      const expectedTotalSol = contributions.reduce((sum, c) => sum.add(c.sol), new BN(0));
+      assert.equal(state.totalSolRaised.toString(), expectedTotalSol.toString());
+
+      // All users claim
+      const claimedAmounts = [];
+      for (const { keypair, contribution } of users) {
+        const [userCommitmentPDA] = PublicKey.findProgramAddressSync(
+          [USER_COMMITMENT_SEED, keypair.publicKey.toBuffer()],
+          program.programId
+        );
+
+        const userTokenAccount = await getOrCreateAssociatedTokenAccount(
+          provider.connection,
+          keypair,
+          tokenMint,
+          keypair.publicKey
+        );
+
+        await program.methods
+          .claimTokens()
+          .accounts({
+            userCommitment: userCommitmentPDA,
+            distributionState: distributionStatePDA,
+            tokenVault: tokenVaultPDA,
+            userTokenAccount: userTokenAccount.address,
+            user: keypair.publicKey,
+            tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+          } as any)
+          .signers([keypair])
+          .rpc();
+
+        const balance = await getAccount(provider.connection, userTokenAccount.address);
+        claimedAmounts.push({
+          user: keypair.publicKey,
+          contribution: contribution.sol,
+          claimed: new BN(balance.amount.toString()),
+        });
+      }
+
+      // Verify fair distribution
+      const totalClaimed = claimedAmounts.reduce((sum, c) => sum.add(c.claimed), new BN(0));
+      assert.ok(totalClaimed.lte(totalTokens), "Total claimed exceeds total tokens");
+
+      // Verify proportional distribution
+      for (let i = 0; i < claimedAmounts.length; i++) {
+        const userShare = claimedAmounts[i].contribution.toNumber() / expectedTotalSol.toNumber();
+        const expectedTokens = Math.floor(totalTokens.toNumber() * userShare);
+        const actualTokens = claimedAmounts[i].claimed.toNumber();
+        
+        // Allow 1% variance for rounding
+        const variance = Math.abs(actualTokens - expectedTokens) / expectedTokens;
+        assert.ok(variance < 0.01, `User ${i} received unfair distribution`);
+      }
+    });
+
+    it("Should handle concurrent operations correctly", async () => {
+      // Initialize
+      const commitEndTime = new BN(Math.floor(Date.now() / 1000) + 3600);
+      const rate = 1.0;
+      const targetRaise = new BN(100 * LAMPORTS_PER_SOL);
+
+      await program.methods
+        .initialize(commitEndTime, rate, targetRaise)
+        .accounts({
+          distributionState: distributionStatePDA,
+          authority: distributionAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      const backendPubkey = new PublicKey(backendSigner.publicKey);
+      await program.methods
+        .initializeBackendAuthority(backendPubkey)
+        .accounts({
+          backendAuthority: backendAuthorityPDA,
+          authority: distributionAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      // Create 10 users
+      const users = [];
+      for (let i = 0; i < 10; i++) {
+        const user = Keypair.generate();
+        await CONNECTION.requestAirdrop(user.publicKey, 20 * LAMPORTS_PER_SOL);
+        users.push(user);
+      }
+
+      // Wait for airdrops to confirm
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      // Prepare all commit transactions
+      const commitPromises = [];
+      let nonceCounter = 1;
+
+      for (const user of users) {
+        const points = new BN(10);
+        const solAmount = new BN(0.1 * LAMPORTS_PER_SOL);
+        const nonce = new BN(nonceCounter++);
+        const expiry = new BN(Math.floor(Date.now() / 1000) + 60);
+        const [userCommitmentPDA] = PublicKey.findProgramAddressSync(
+          [USER_COMMITMENT_SEED, user.publicKey.toBuffer()],
+          program.programId
+        );
+
+        const msg = Buffer.concat([
+          Buffer.from("POINTS_DEDUCTION_PROOF:"),
+          user.publicKey.toBuffer(),
+          points.toBuffer("le", 8),
+          nonce.toBuffer("le", 8),
+          expiry.toBuffer("le", 8),
+        ]);
+        const signature = nacl.sign.detached(msg, backendSigner.secretKey);
+
+        const commitPromise = program.methods
+          .commitResources(points, solAmount, Array.from(signature), nonce, expiry)
+          .accounts({
+            userCommitment: userCommitmentPDA,
+            backendAuthority: backendAuthorityPDA,
+            distributionState: distributionStatePDA,
+            user: user.publicKey,
+            systemProgram: SystemProgram.programId,
+          } as any)
+          .signers([user])
+          .rpc();
+
+        commitPromises.push(commitPromise);
+      }
+
+      // Execute all commits concurrently
+      const results = await Promise.allSettled(commitPromises);
+      
+      // Count successful commits
+      const successfulCommits = results.filter(r => r.status === 'fulfilled').length;
+      assert.ok(successfulCommits >= 8, "Too many concurrent commits failed");
+
+      // Verify final state
+      const state = await program.account.distributionState.fetch(distributionStatePDA);
+      assert.ok(state.totalSolRaised.gt(new BN(0)), "No SOL was raised");
+    });
+  });
+
+  describe("Full Lifecycle Tests", () => {
+    it("Should complete full cycle: Initialize → Fund → Commit → Claim → Withdraw", async () => {
+      // 1. Initialize
+      const commitEndTime = new BN(Math.floor(Date.now() / 1000) + 300); // 5 minutes
+      const rate = 1.0;
+      const targetRaise = new BN(10 * LAMPORTS_PER_SOL);
+
+      [distributionStatePDA] = PublicKey.findProgramAddressSync(
+        [DISTRIBUTION_STATE_SEED],
+        program.programId
+      );
+      [backendAuthorityPDA] = PublicKey.findProgramAddressSync(
+        [BACKEND_AUTHORITY_SEED],
+        program.programId
+      );
+      [tokenVaultPDA] = PublicKey.findProgramAddressSync(
+        [TOKEN_VAULT_SEED, distributionStatePDA.toBuffer()],
+        program.programId
+      );
+
+      await program.methods
+        .initialize(commitEndTime, rate, targetRaise)
+        .accounts({
+          distributionState: distributionStatePDA,
+          authority: distributionAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      const backendPubkey = new PublicKey(backendSigner.publicKey);
+      await program.methods
+        .initializeBackendAuthority(backendPubkey)
+        .accounts({
+          backendAuthority: backendAuthorityPDA,
+          authority: distributionAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      // 2. Create token and fund vault
+      tokenMint = await createMint(
+        provider.connection,
+        distributionAuthority,
+        distributionAuthority.publicKey,
+        null,
+        9
+      );
+
+      await program.methods
+        .createTokenVault()
+        .accounts({
+          tokenVault: tokenVaultPDA,
+          distributionState: distributionStatePDA,
+          tokenMint: tokenMint,
+          authority: distributionAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+          tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      const authorityTokenAccount = await getOrCreateAssociatedTokenAccount(
+        provider.connection,
+        distributionAuthority,
+        tokenMint,
+        distributionAuthority.publicKey
+      );
+
+      const fundAmount = new BN(1_000_000_000_000); // 1000 tokens
+      await mintTo(
+        provider.connection,
+        distributionAuthority,
+        tokenMint,
+        authorityTokenAccount.address,
+        distributionAuthority,
+        fundAmount.toNumber()
+      );
+
+      await program.methods
+        .fundVault(fundAmount)
+        .accounts({
+          distributionState: distributionStatePDA,
+          authorityTokenAccount: authorityTokenAccount.address,
+          tokenVault: tokenVaultPDA,
+          authority: distributionAuthority.publicKey,
+          tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      // 3. Users commit
+      const users = [];
+      for (let i = 0; i < 3; i++) {
+        const user = Keypair.generate();
+        await CONNECTION.requestAirdrop(user.publicKey, 20 * LAMPORTS_PER_SOL);
+        await CONNECTION.confirmTransaction(
+          await CONNECTION.requestAirdrop(user.publicKey, 20 * LAMPORTS_PER_SOL),
+          "confirmed"
+        );
+        users.push(user);
+      }
+
+      let nonceCounter = 1;
+      for (const user of users) {
+        const points = new BN(100);
+        const solAmount = new BN(1 * LAMPORTS_PER_SOL);
+        const nonce = new BN(nonceCounter++);
+        const expiry = new BN(Math.floor(Date.now() / 1000) + 60);
+        const [userCommitmentPDA] = PublicKey.findProgramAddressSync(
+          [USER_COMMITMENT_SEED, user.publicKey.toBuffer()],
+          program.programId
+        );
+
+        const msg = Buffer.concat([
+          Buffer.from("POINTS_DEDUCTION_PROOF:"),
+          user.publicKey.toBuffer(),
+          points.toBuffer("le", 8),
+          nonce.toBuffer("le", 8),
+          expiry.toBuffer("le", 8),
+        ]);
+        const signature = nacl.sign.detached(msg, backendSigner.secretKey);
+
+        await program.methods
+          .commitResources(points, solAmount, Array.from(signature), nonce, expiry)
+          .accounts({
+            userCommitment: userCommitmentPDA,
+            backendAuthority: backendAuthorityPDA,
+            distributionState: distributionStatePDA,
+            user: user.publicKey,
+            systemProgram: SystemProgram.programId,
+          } as any)
+          .signers([user])
+          .rpc();
+      }
+
+      // 4. Users claim tokens
+      for (const user of users) {
+        const [userCommitmentPDA] = PublicKey.findProgramAddressSync(
+          [USER_COMMITMENT_SEED, user.publicKey.toBuffer()],
+          program.programId
+        );
+
+        const userTokenAccount = await getOrCreateAssociatedTokenAccount(
+          provider.connection,
+          user,
+          tokenMint,
+          user.publicKey
+        );
+
+        await program.methods
+          .claimTokens()
+          .accounts({
+            userCommitment: userCommitmentPDA,
+            distributionState: distributionStatePDA,
+            tokenVault: tokenVaultPDA,
+            userTokenAccount: userTokenAccount.address,
+            user: user.publicKey,
+            tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+          } as any)
+          .signers([user])
+          .rpc();
+
+        const balance = await getAccount(provider.connection, userTokenAccount.address);
+        assert.ok(balance.amount > 0n, "User should have received tokens");
+      }
+
+      // 5. Authority withdraws SOL (wait for commit period to end)
+      await new Promise(resolve => setTimeout(resolve, 6000)); // Wait for commit period to end
+
+      const withdrawAmount = new BN(2 * LAMPORTS_PER_SOL);
+      const authorityBalanceBefore = await CONNECTION.getBalance(distributionAuthority.publicKey);
+
+      await program.methods
+        .withdrawSol(withdrawAmount)
+        .accounts({
+          distributionState: distributionStatePDA,
+          authority: distributionAuthority.publicKey,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      const authorityBalanceAfter = await CONNECTION.getBalance(distributionAuthority.publicKey);
+      assert.ok(
+        authorityBalanceAfter > authorityBalanceBefore,
+        "Authority should have received SOL"
+      );
+    });
+
+    it("Should handle early termination when target is reached", async () => {
+      // Initialize with low target
+      const commitEndTime = new BN(Math.floor(Date.now() / 1000) + 3600);
+      const rate = 1.0;
+      const targetRaise = new BN(3 * LAMPORTS_PER_SOL); // Low target
+
+      [distributionStatePDA] = PublicKey.findProgramAddressSync(
+        [DISTRIBUTION_STATE_SEED],
+        program.programId
+      );
+      [backendAuthorityPDA] = PublicKey.findProgramAddressSync(
+        [BACKEND_AUTHORITY_SEED],
+        program.programId
+      );
+
+      await program.methods
+        .initialize(commitEndTime, rate, targetRaise)
+        .accounts({
+          distributionState: distributionStatePDA,
+          authority: distributionAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      const backendPubkey = new PublicKey(backendSigner.publicKey);
+      await program.methods
+        .initializeBackendAuthority(backendPubkey)
+        .accounts({
+          backendAuthority: backendAuthorityPDA,
+          authority: distributionAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      // Users commit until target is reached
+      const users = [];
+      for (let i = 0; i < 4; i++) {
+        const user = Keypair.generate();
+        await CONNECTION.requestAirdrop(user.publicKey, 20 * LAMPORTS_PER_SOL);
+        users.push(user);
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      let nonceCounter = 1;
+      let targetReached = false;
+
+      for (const user of users) {
+        if (targetReached) break;
+
+        const points = new BN(100);
+        const solAmount = new BN(1 * LAMPORTS_PER_SOL);
+        const nonce = new BN(nonceCounter++);
+        const expiry = new BN(Math.floor(Date.now() / 1000) + 60);
+        const [userCommitmentPDA] = PublicKey.findProgramAddressSync(
+          [USER_COMMITMENT_SEED, user.publicKey.toBuffer()],
+          program.programId
+        );
+
+        const msg = Buffer.concat([
+          Buffer.from("POINTS_DEDUCTION_PROOF:"),
+          user.publicKey.toBuffer(),
+          points.toBuffer("le", 8),
+          nonce.toBuffer("le", 8),
+          expiry.toBuffer("le", 8),
+        ]);
+        const signature = nacl.sign.detached(msg, backendSigner.secretKey);
+
+        await program.methods
+          .commitResources(points, solAmount, Array.from(signature), nonce, expiry)
+          .accounts({
+            userCommitment: userCommitmentPDA,
+            backendAuthority: backendAuthorityPDA,
+            distributionState: distributionStatePDA,
+            user: user.publicKey,
+            systemProgram: SystemProgram.programId,
+          } as any)
+          .signers([user])
+          .rpc();
+
+        const state = await program.account.distributionState.fetch(distributionStatePDA);
+        if (state.totalSolRaised.gte(targetRaise)) {
+          targetReached = true;
+          assert.ok(!state.isActive, "Distribution should be inactive after target reached");
+        }
+      }
+
+      assert.ok(targetReached, "Target should have been reached");
+
+      // Authority can withdraw immediately after target is reached
+      const withdrawAmount = new BN(2 * LAMPORTS_PER_SOL);
+      await program.methods
+        .withdrawSol(withdrawAmount)
+        .accounts({
+          distributionState: distributionStatePDA,
+          authority: distributionAuthority.publicKey,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+    });
+
+    it("Should handle backend authority updates during operation", async () => {
+      // Initialize
+      const commitEndTime = new BN(Math.floor(Date.now() / 1000) + 3600);
+      const rate = 1.0;
+      const targetRaise = new BN(100 * LAMPORTS_PER_SOL);
+
+      [distributionStatePDA] = PublicKey.findProgramAddressSync(
+        [DISTRIBUTION_STATE_SEED],
+        program.programId
+      );
+      [backendAuthorityPDA] = PublicKey.findProgramAddressSync(
+        [BACKEND_AUTHORITY_SEED],
+        program.programId
+      );
+
+      await program.methods
+        .initialize(commitEndTime, rate, targetRaise)
+        .accounts({
+          distributionState: distributionStatePDA,
+          authority: distributionAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      const backendPubkey = new PublicKey(backendSigner.publicKey);
+      await program.methods
+        .initializeBackendAuthority(backendPubkey)
+        .accounts({
+          backendAuthority: backendAuthorityPDA,
+          authority: distributionAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      // User 1 commits successfully
+      const user1 = Keypair.generate();
+      await CONNECTION.requestAirdrop(user1.publicKey, 10 * LAMPORTS_PER_SOL);
+      await CONNECTION.confirmTransaction(
+        await CONNECTION.requestAirdrop(user1.publicKey, 10 * LAMPORTS_PER_SOL),
+        "confirmed"
+      );
+
+      const points1 = new BN(50);
+      const solAmount1 = new BN(50);
+      const nonce1 = new BN(1);
+      const expiry1 = new BN(Math.floor(Date.now() / 1000) + 60);
+      const [user1CommitmentPDA] = PublicKey.findProgramAddressSync(
+        [USER_COMMITMENT_SEED, user1.publicKey.toBuffer()],
+        program.programId
+      );
+
+      const msg1 = Buffer.concat([
+        Buffer.from("POINTS_DEDUCTION_PROOF:"),
+        user1.publicKey.toBuffer(),
+        points1.toBuffer("le", 8),
+        nonce1.toBuffer("le", 8),
+        expiry1.toBuffer("le", 8),
+      ]);
+      const signature1 = nacl.sign.detached(msg1, backendSigner.secretKey);
+
+      await program.methods
+        .commitResources(points1, solAmount1, Array.from(signature1), nonce1, expiry1)
+        .accounts({
+          userCommitment: user1CommitmentPDA,
+          backendAuthority: backendAuthorityPDA,
+          distributionState: distributionStatePDA,
+          user: user1.publicKey,
+          systemProgram: SystemProgram.programId,
+        } as any)
+        .signers([user1])
+        .rpc();
+
+      // Deactivate backend
+      await program.methods
+        .updateBackendAuthority(false)
+        .accounts({
+          backendAuthority: backendAuthorityPDA,
+          authority: distributionAuthority.publicKey,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      // User 2 tries to commit but fails
+      const user2 = Keypair.generate();
+      await CONNECTION.requestAirdrop(user2.publicKey, 10 * LAMPORTS_PER_SOL);
+      await CONNECTION.confirmTransaction(
+        await CONNECTION.requestAirdrop(user2.publicKey, 10 * LAMPORTS_PER_SOL),
+        "confirmed"
+      );
+
+      const points2 = new BN(50);
+      const solAmount2 = new BN(50);
+      const nonce2 = new BN(2);
+      const expiry2 = new BN(Math.floor(Date.now() / 1000) + 60);
+      const [user2CommitmentPDA] = PublicKey.findProgramAddressSync(
+        [USER_COMMITMENT_SEED, user2.publicKey.toBuffer()],
+        program.programId
+      );
+
+      const msg2 = Buffer.concat([
+        Buffer.from("POINTS_DEDUCTION_PROOF:"),
+        user2.publicKey.toBuffer(),
+        points2.toBuffer("le", 8),
+        nonce2.toBuffer("le", 8),
+        expiry2.toBuffer("le", 8),
+      ]);
+      const signature2 = nacl.sign.detached(msg2, backendSigner.secretKey);
+
+      try {
+        await program.methods
+          .commitResources(points2, solAmount2, Array.from(signature2), nonce2, expiry2)
+          .accounts({
+            userCommitment: user2CommitmentPDA,
+            backendAuthority: backendAuthorityPDA,
+            distributionState: distributionStatePDA,
+            user: user2.publicKey,
+            systemProgram: SystemProgram.programId,
+          } as any)
+          .signers([user2])
+          .rpc();
+        assert.fail("Should have failed with backend inactive");
+      } catch (err) {
+        assert.include(err.toString(), "BackendInactive");
+      }
+
+      // Reactivate backend
+      await program.methods
+        .updateBackendAuthority(true)
+        .accounts({
+          backendAuthority: backendAuthorityPDA,
+          authority: distributionAuthority.publicKey,
+        } as any)
+        .signers([distributionAuthority])
+        .rpc();
+
+      // User 2 can now commit
+      await program.methods
+        .commitResources(points2, solAmount2, Array.from(signature2), nonce2, expiry2)
+        .accounts({
+          userCommitment: user2CommitmentPDA,
+          backendAuthority: backendAuthorityPDA,
+          distributionState: distributionStatePDA,
+          user: user2.publicKey,
+          systemProgram: SystemProgram.programId,
+        } as any)
+        .signers([user2])
+        .rpc();
+
+      // Verify both commitments succeeded
+      const commitment1 = await program.account.userCommitment.fetch(user1CommitmentPDA);
+      const commitment2 = await program.account.userCommitment.fetch(user2CommitmentPDA);
+      assert.ok(commitment1.user.equals(user1.publicKey));
+      assert.ok(commitment2.user.equals(user2.publicKey));
+    });
+  });
+});

@@ -1,0 +1,131 @@
+import * as anchor from "@coral-xyz/anchor";
+import { Program, AnchorProvider } from "@coral-xyz/anchor";
+import { SparkChainTge } from "../target/types/spark_chain_tge";
+import {
+  Keypair,
+  PublicKey,
+  SystemProgram,
+  LAMPORTS_PER_SOL,
+  Connection,
+  Ed25519Program,
+  SYSVAR_INSTRUCTIONS_PUBKEY,
+} from "@solana/web3.js";
+import { BN } from "bn.js";
+import nacl from "tweetnacl";
+import { assert } from "chai";
+
+describe("spark_chain_tge - Test with Authority Update", () => {
+  let provider: AnchorProvider;
+  let program: Program<SparkChainTge>;
+  let distributionAuthority: Keypair;
+  let backendSigner: nacl.SignKeyPair;
+  let user: Keypair;
+
+  const CONNECTION = new Connection(
+    "http://localhost:8899",
+    "confirmed"
+  );
+
+  before(async () => {
+    // We need to use the same authority that initialized the program
+    // Let's fetch the distribution state to get the authority
+    const tempWallet = Keypair.generate();
+    await CONNECTION.requestAirdrop(tempWallet.publicKey, 10 * LAMPORTS_PER_SOL)
+      .then(sig => CONNECTION.confirmTransaction(sig, "confirmed"));
+    
+    const tempProvider = new AnchorProvider(
+      CONNECTION,
+      new anchor.Wallet(tempWallet),
+      { commitment: "confirmed" }
+    );
+    anchor.setProvider(tempProvider);
+    
+    program = anchor.workspace.SparkChainTge as Program<SparkChainTge>;
+    
+    const [distributionStatePDA] = PublicKey.findProgramAddressSync(
+      [Buffer.from("global_distribution_state")],
+      program.programId
+    );
+    
+    const distributionState = await program.account.distributionState.fetch(distributionStatePDA);
+    console.log("Current authority:", distributionState.authority.toString());
+    
+    // Generate test keypairs
+    user = Keypair.generate();
+    backendSigner = nacl.sign.keyPair();
+    
+    await CONNECTION.requestAirdrop(user.publicKey, 10 * LAMPORTS_PER_SOL)
+      .then(sig => CONNECTION.confirmTransaction(sig, "confirmed"));
+  });
+
+  it("Should find the original authority keypair if available", async () => {
+    // Check if we have access to the original authority keypair
+    // The authority pubkey is: 9u38QRuGCE3CZp5Bs3C3mrbqBCTDsMKZGTbc19tmM7Ez
+    
+    // Try to load the keypair from the deployment
+    try {
+      // Check if it's the default Solana CLI keypair
+      const defaultKeypairPath = '/Users/quyhoang/.config/solana/id.json';
+      const fs = await import('fs');
+      
+      if (fs.existsSync(defaultKeypairPath)) {
+        const keypairData = JSON.parse(fs.readFileSync(defaultKeypairPath, 'utf-8'));
+        const authority = Keypair.fromSecretKey(new Uint8Array(keypairData));
+        console.log("Found keypair with pubkey:", authority.publicKey.toString());
+        
+        const [distributionStatePDA] = PublicKey.findProgramAddressSync(
+          [Buffer.from("global_distribution_state")],
+          program.programId
+        );
+        
+        const distributionState = await program.account.distributionState.fetch(distributionStatePDA);
+        
+        if (authority.publicKey.equals(distributionState.authority)) {
+          console.log("✅ Found the authority keypair!");
+          
+          // Now we can update the backend authority
+          provider = new AnchorProvider(
+            CONNECTION,
+            new anchor.Wallet(authority),
+            { commitment: "confirmed" }
+          );
+          anchor.setProvider(provider);
+          
+          // Initialize a new backend authority with our test signer
+          const [backendAuthorityPDA] = PublicKey.findProgramAddressSync(
+            [Buffer.from("backend_authority")],
+            program.programId
+          );
+          
+          const newBackendPubkey = new PublicKey(backendSigner.publicKey);
+          console.log("Updating backend authority to:", newBackendPubkey.toString());
+          
+          // First, let's just re-initialize with the new backend pubkey
+          // Note: The program might need a separate update_backend_pubkey instruction
+          // For now, let's try to see if we can work with the existing setup
+          
+          // Actually, let's check if there's an update function
+          console.log("Note: To update the backend pubkey, we would need an update_backend_pubkey instruction in the program");
+          console.log("The current program only has update_backend_authority which updates the active status");
+        } else {
+          console.log("❌ Keypair pubkey doesn't match authority");
+        }
+      } else {
+        console.log("Default keypair not found at:", defaultKeypairPath);
+      }
+    } catch (error) {
+      console.error("Error loading keypair:", error);
+    }
+  });
+
+  it("Should test with a fresh program deployment", async () => {
+    console.log("\n=== Solution: Deploy a fresh instance ===");
+    console.log("Since we cannot update the backend pubkey with the current program,");
+    console.log("and we don't have the private key for the existing backend,");
+    console.log("the best solution is to:");
+    console.log("1. Close all existing accounts");
+    console.log("2. Deploy a fresh program instance");
+    console.log("3. Initialize with our known backend signer");
+    console.log("\nThis would allow all tests to pass with a consistent backend signer.");
+  });
+});

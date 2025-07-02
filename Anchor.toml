@@ -1,0 +1,29 @@
+[toolchain]
+anchor_version = "0.31.1"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.devnet]
+spark_chain_tge = "5FmNvJb7PpUtpfvK1iXkcBcKEDbsGQJb1s9MqWfwHyrV"
+
+[programs.localnet]
+spark_chain_tge = "5FmNvJb7PpUtpfvK1iXkcBcKEDbsGQJb1s9MqWfwHyrV"
+
+[program.mainnet]
+spark_chain_tge = "5FmNvJb7PpUtpfvK1iXkcBcKEDbsGQJb1s9MqWfwHyrV"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[provider.mainnet]
+cluster = "mainnet-beta"
+wallet = "~/spark-deloyer-keypair.json"
+
+[scripts]
+test = "yarn test"

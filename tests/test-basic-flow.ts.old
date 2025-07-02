@@ -1,0 +1,243 @@
+import * as anchor from "@coral-xyz/anchor";
+import { Program, AnchorProvider } from "@coral-xyz/anchor";
+import { SparkChainTge } from "../target/types/spark_chain_tge";
+import {
+  Keypair,
+  PublicKey,
+  SystemProgram,
+  LAMPORTS_PER_SOL,
+  Connection,
+  Ed25519Program,
+  SYSVAR_INSTRUCTIONS_PUBKEY,
+  TransactionInstruction,
+} from "@solana/web3.js";
+import { BN } from "bn.js";
+import {
+  createMint,
+  getOrCreateAssociatedTokenAccount,
+  mintTo,
+  getAccount,
+} from "@solana/spl-token";
+import nacl from "tweetnacl";
+import { assert } from "chai";
+
+describe("spark_chain_tge - Basic Flow Test", () => {
+  let provider: AnchorProvider;
+  let program: Program<SparkChainTge>;
+  let distributionAuthority: Keypair;
+  let backendSigner: nacl.SignKeyPair;
+  let backendAuthorityPDA: PublicKey;
+  let distributionStatePDA: PublicKey;
+  let tokenMint: PublicKey;
+  let tokenVaultPDA: PublicKey;
+  let user: Keypair;
+
+  const CONNECTION = new Connection(
+    "http://localhost:8899",
+    "confirmed"
+  );
+
+  const DISTRIBUTION_STATE_SEED = Buffer.from("global_distribution_state");
+  const BACKEND_AUTHORITY_SEED = Buffer.from("backend_authority");
+  const TOKEN_VAULT_SEED = Buffer.from("token_vault");
+  const USER_COMMITMENT_SEED = Buffer.from("commitment");
+
+  before(async () => {
+    // Generate keypairs
+    distributionAuthority = Keypair.generate();
+    user = Keypair.generate();
+    backendSigner = nacl.sign.keyPair();
+
+    // Airdrop SOL
+    await CONNECTION.requestAirdrop(
+      distributionAuthority.publicKey,
+      100 * LAMPORTS_PER_SOL
+    ).then(sig => CONNECTION.confirmTransaction(sig, "confirmed"));
+
+    await CONNECTION.requestAirdrop(
+      user.publicKey,
+      10 * LAMPORTS_PER_SOL
+    ).then(sig => CONNECTION.confirmTransaction(sig, "confirmed"));
+
+    // Setup provider
+    provider = new AnchorProvider(
+      CONNECTION,
+      new anchor.Wallet(distributionAuthority),
+      { commitment: "confirmed" }
+    );
+    anchor.setProvider(provider);
+
+    program = anchor.workspace.SparkChainTge as Program<SparkChainTge>;
+
+    // Find PDAs
+    [distributionStatePDA] = PublicKey.findProgramAddressSync(
+      [DISTRIBUTION_STATE_SEED],
+      program.programId
+    );
+    [backendAuthorityPDA] = PublicKey.findProgramAddressSync(
+      [BACKEND_AUTHORITY_SEED],
+      program.programId
+    );
+    [tokenVaultPDA] = PublicKey.findProgramAddressSync(
+      [TOKEN_VAULT_SEED, distributionStatePDA.toBuffer()],
+      program.programId
+    );
+  });
+
+  it("Should verify existing state and test available operations", async () => {
+    // 1. Initialize distribution
+    const commitEndTime = new BN(Math.floor(Date.now() / 1000) + 3600);
+    const rate = 1.0;
+    const targetRaise = new BN(1000 * LAMPORTS_PER_SOL);
+
+    await program.methods
+      .initialize(commitEndTime, rate, targetRaise)
+      .accounts({
+        distributionState: distributionStatePDA,
+        authority: distributionAuthority.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([distributionAuthority])
+      .rpc();
+
+    // 2. Initialize backend authority
+    const backendPubkey = new PublicKey(backendSigner.publicKey);
+    await program.methods
+      .initializeBackendAuthority(backendPubkey)
+      .accounts({
+        backendAuthority: backendAuthorityPDA,
+        authority: distributionAuthority.publicKey,
+        systemProgram: SystemProgram.programId,
+      })
+      .signers([distributionAuthority])
+      .rpc();
+
+    // 3. Create token mint and vault
+    tokenMint = await createMint(
+      provider.connection,
+      distributionAuthority,
+      distributionAuthority.publicKey,
+      null,
+      9
+    );
+
+    await program.methods
+      .createTokenVault()
+      .accounts({
+        tokenVault: tokenVaultPDA,
+        distributionState: distributionStatePDA,
+        tokenMint: tokenMint,
+        authority: distributionAuthority.publicKey,
+        systemProgram: SystemProgram.programId,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+        rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+      })
+      .signers([distributionAuthority])
+      .rpc();
+
+    // 4. Fund the vault
+    const authorityTokenAccount = await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      distributionAuthority,
+      tokenMint,
+      distributionAuthority.publicKey
+    );
+
+    const fundAmount = new BN(1_000_000_000);
+    await mintTo(
+      provider.connection,
+      distributionAuthority,
+      tokenMint,
+      authorityTokenAccount.address,
+      distributionAuthority,
+      fundAmount.toNumber()
+    );
+
+    await program.methods
+      .fundVault(fundAmount)
+      .accounts({
+        distributionState: distributionStatePDA,
+        authorityTokenAccount: authorityTokenAccount.address,
+        tokenVault: tokenVaultPDA,
+        authority: distributionAuthority.publicKey,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+      })
+      .signers([distributionAuthority])
+      .rpc();
+
+    // 5. User commits resources
+    const points = new BN(100);
+    const solAmount = new BN(1 * LAMPORTS_PER_SOL);
+    const nonce = new BN(1);
+    const expiry = new BN(Math.floor(Date.now() / 1000) + 60);
+    const [userCommitmentPDA] = PublicKey.findProgramAddressSync(
+      [USER_COMMITMENT_SEED, user.publicKey.toBuffer()],
+      program.programId
+    );
+
+    // Create proof message
+    const msg = Buffer.concat([
+      Buffer.from("POINTS_DEDUCTION_PROOF:"),
+      user.publicKey.toBuffer(),
+      points.toBuffer("le", 8),
+      nonce.toBuffer("le", 8),
+      expiry.toBuffer("le", 8),
+    ]);
+    const signature = nacl.sign.detached(msg, backendSigner.secretKey);
+
+    // Create Ed25519 instruction for signature verification
+    const ed25519Instruction = Ed25519Program.createInstructionWithPublicKey({
+      publicKey: backendPubkey.toBytes(),
+      message: msg,
+      signature: signature,
+    });
+
+    // First, add the Ed25519 instruction to the transaction
+    const commitTx = await program.methods
+      .commitResources(points, solAmount, Array.from(signature), nonce, expiry)
+      .accounts({
+        userCommitment: userCommitmentPDA,
+        backendAuthority: backendAuthorityPDA,
+        distributionState: distributionStatePDA,
+        user: user.publicKey,
+        systemProgram: SystemProgram.programId,
+        instructions: SYSVAR_INSTRUCTIONS_PUBKEY,
+      })
+      .preInstructions([ed25519Instruction])
+      .signers([user])
+      .rpc();
+
+    console.log("Commit transaction:", commitTx);
+
+    // Verify commitment
+    const commitment = await program.account.userCommitment.fetch(userCommitmentPDA);
+    assert.equal(commitment.user.toString(), user.publicKey.toString());
+    assert.equal(commitment.points.toString(), points.toString());
+
+    // 6. User claims tokens
+    const userTokenAccount = await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      user,
+      tokenMint,
+      user.publicKey
+    );
+
+    await program.methods
+      .claimTokens()
+      .accounts({
+        userCommitment: userCommitmentPDA,
+        distributionState: distributionStatePDA,
+        tokenVault: tokenVaultPDA,
+        userTokenAccount: userTokenAccount.address,
+        user: user.publicKey,
+        tokenProgram: anchor.utils.token.TOKEN_PROGRAM_ID,
+      })
+      .signers([user])
+      .rpc();
+
+    // Verify tokens received
+    const tokenBalance = await getAccount(provider.connection, userTokenAccount.address);
+    assert.ok(tokenBalance.amount > 0n, "User should have received tokens");
+    console.log("User received tokens:", tokenBalance.amount.toString());
+  });
+});
