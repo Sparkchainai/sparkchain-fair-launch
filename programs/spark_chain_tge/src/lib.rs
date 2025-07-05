@@ -108,9 +108,20 @@ pub mod spark_chain_tge {
     pub fn claim_tokens(ctx: Context<ClaimTokens>) -> Result<()> {
         let user_commitment = &mut ctx.accounts.user_commitment;
         let distribution_state = &ctx.accounts.distribution_state;
+        let clock = Clock::get()?;
 
         require!(!user_commitment.tokens_claimed, ErrorCode::AlreadyClaimed);
         require!(distribution_state.total_score > 0, ErrorCode::NoCommitments);
+
+        // Can claim tokens if either commit period has ended OR target raise has been reached
+        let commit_period_ended = clock.unix_timestamp >= distribution_state.commit_end_time;
+        let target_reached =
+            distribution_state.total_sol_raised >= distribution_state.target_raise_sol;
+
+        require!(
+            commit_period_ended || target_reached,
+            ErrorCode::ClaimConditionsNotMet
+        );
 
         // Calculate token allocation using integer arithmetic
         // token_amount = (total_token_pool * user_score) / total_score
@@ -825,6 +836,8 @@ pub enum ErrorCode {
     InsufficientSolCommitment,
     #[msg("Withdraw conditions not met - commit period must end or target raise must be reached")]
     WithdrawConditionsNotMet,
+    #[msg("Claim conditions not met - commit period must end or target raise must be reached")]
+    ClaimConditionsNotMet,
     // Hybrid Approach Errors
     #[msg("Backend is inactive")]
     BackendInactive,
