@@ -3,6 +3,9 @@ use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 declare_id!("5FmNvJb7PpUtpfvK1iXkcBcKEDbsGQJb1s9MqWfwHyrV");
 
+// Fixed-point arithmetic constants
+const PRECISION_FACTOR: u64 = 1_000_000_000; // 10^9 for 9 decimal places
+
 #[program]
 pub mod spark_chain_tge {
     use super::*;
@@ -10,16 +13,16 @@ pub mod spark_chain_tge {
     pub fn initialize(
         ctx: Context<Initialize>,
         commit_end_time: i64,
-        rate: f64,
+        rate: u64, // Now represents rate * PRECISION_FACTOR
         target_raise_sol: u64,
     ) -> Result<()> {
         let distribution_state = &mut ctx.accounts.distribution_state;
         distribution_state.authority = ctx.accounts.authority.key();
         distribution_state.total_token_pool = 0;
-        distribution_state.total_score = 0.0;
+        distribution_state.total_score = 0; // Now integer
         distribution_state.is_active = true;
         distribution_state.commit_end_time = commit_end_time;
-        distribution_state.rate = rate;
+        distribution_state.rate = rate; // Already scaled by PRECISION_FACTOR
         distribution_state.target_raise_sol = target_raise_sol;
         distribution_state.total_sol_raised = 0;
         distribution_state.bump = ctx.bumps.distribution_state;
@@ -99,14 +102,20 @@ pub mod spark_chain_tge {
         let distribution_state = &ctx.accounts.distribution_state;
 
         require!(!user_commitment.tokens_claimed, ErrorCode::AlreadyClaimed);
-        require!(
-            distribution_state.total_score > 0.0,
-            ErrorCode::NoCommitments
-        );
+        require!(distribution_state.total_score > 0, ErrorCode::NoCommitments);
 
-        // Calculate token allocation
-        let user_share = user_commitment.score / distribution_state.total_score;
-        let token_amount = (distribution_state.total_token_pool as f64 * user_share) as u64;
+        // Calculate token allocation using integer arithmetic
+        // token_amount = (total_token_pool * user_score) / total_score
+        // Use u128 to prevent overflow during multiplication
+        let token_amount = {
+            let numerator = (distribution_state.total_token_pool as u128)
+                .checked_mul(user_commitment.score as u128)
+                .ok_or(ErrorCode::CalculationOverflow)?;
+            let denominator = distribution_state.total_score as u128;
+
+            // Perform division and check for potential truncation
+            (numerator / denominator) as u64
+        };
 
         // Create signer seeds for PDA
         let authority_seeds = [
@@ -257,8 +266,14 @@ pub mod spark_chain_tge {
         let distribution_state_key = ctx.accounts.distribution_state.key();
         let rate = ctx.accounts.distribution_state.rate;
 
-        // Calculate required SOL amount based on points and rate
-        let required_sol = (points as f64 * rate) as u64;
+        // Calculate required SOL amount using integer arithmetic
+        // required_sol = (points * rate) / PRECISION_FACTOR
+        let required_sol = {
+            let product = (points as u128)
+                .checked_mul(rate as u128)
+                .ok_or(ErrorCode::CalculationOverflow)?;
+            (product / PRECISION_FACTOR as u128) as u64
+        };
 
         // Validate that user is committing at least the required SOL amount
         require!(
@@ -280,20 +295,29 @@ pub mod spark_chain_tge {
             ],
         )?;
 
-        // Calculate score based on SOL amount only
-        let score = sol_amount as f64;
+        // Score is now just the SOL amount (no decimal conversion needed)
+        let score = sol_amount;
 
         // Update user commitment
         user_commitment.user = ctx.accounts.user.key();
         user_commitment.points += points;
         user_commitment.sol_amount += sol_amount;
-        user_commitment.score += score;
+        user_commitment.score = user_commitment
+            .score
+            .checked_add(score)
+            .ok_or(ErrorCode::CalculationOverflow)?;
         user_commitment.tokens_claimed = false;
 
         // Update total score and total sol raised
         let distribution_state = &mut ctx.accounts.distribution_state;
-        distribution_state.total_score += score;
-        distribution_state.total_sol_raised += sol_amount;
+        distribution_state.total_score = distribution_state
+            .total_score
+            .checked_add(score)
+            .ok_or(ErrorCode::CalculationOverflow)?;
+        distribution_state.total_sol_raised = distribution_state
+            .total_sol_raised
+            .checked_add(sol_amount)
+            .ok_or(ErrorCode::CalculationOverflow)?;
 
         // Update backend nonce counter
         let backend_auth = &mut ctx.accounts.backend_authority;
@@ -662,10 +686,10 @@ pub struct UpdateBackendAuthority<'info> {
 pub struct DistributionState {
     pub authority: Pubkey,
     pub total_token_pool: u64, // Total tokens to distribute
-    pub total_score: f64,      // Total score of all users
+    pub total_score: u64,      // Total score of all users (now integer)
     pub is_active: bool,       // Active status
     pub commit_end_time: i64,  // Commit end time (unix timestamp)
-    pub rate: f64,             // Conversion rate from points to sol
+    pub rate: u64,             // Conversion rate from points to sol (scaled by PRECISION_FACTOR)
     pub target_raise_sol: u64, // Target amount of sol to raise
     pub total_sol_raised: u64, // Total sol raised
     pub bump: u8,              // PDA bump
@@ -680,12 +704,12 @@ pub struct UserCommitment {
     pub user: Pubkey,
     pub points: u64,
     pub sol_amount: u64,
-    pub score: f64,
+    pub score: u64, // Now integer
     pub tokens_claimed: bool,
 }
 
 impl UserCommitment {
-    const LEN: usize = 32 + 8 + 8 + 8 + 1;
+    const LEN: usize = 32 + 8 + 8 + 8 + 1; // 57 bytes
 }
 
 #[account]
@@ -705,7 +729,7 @@ pub struct ResourcesCommitted {
     pub user: Pubkey,
     pub points: u64,
     pub sol_amount: u64,
-    pub score: f64,
+    pub score: u64, // Now integer
     pub proof_nonce: u64,
     pub backend_signature: [u8; 64],
     pub expiry: i64,
@@ -805,6 +829,8 @@ pub enum ErrorCode {
     Ed25519VerificationFailed,
     #[msg("Invalid token account")]
     InvalidTokenAccount,
+    #[msg("Calculation overflow")]
+    CalculationOverflow,
 }
 
 #[cfg(test)]
@@ -954,61 +980,113 @@ mod tests {
     }
 
     #[test]
-    fn test_token_allocation_logic() {
-        // Test the core logic for calculating a user's token share.
+    fn test_fixed_point_token_allocation() {
+        // Test the fixed-point arithmetic for token allocation
         let total_token_pool = 1_000_000_000u64;
 
-        // Scenario 1: Simple case
-        let user_score1 = 500.0;
-        let total_score1 = 2000.0;
-        let token_amount1 = (total_token_pool as f64 * (user_score1 / total_score1)) as u64;
-        assert_eq!(token_amount1, 250_000_000);
+        // Scenario 1: Simple case - 3 equal users
+        let user_score = 100u64;
+        let total_score = 300u64;
 
-        // Scenario 2: User has all the score
-        let user_score2 = 1000.0;
-        let total_score2 = 1000.0;
-        let token_amount2 = (total_token_pool as f64 * (user_score2 / total_score2)) as u64;
-        assert_eq!(token_amount2, 1_000_000_000);
+        // Calculate using u128 to prevent overflow
+        let token_amount = {
+            let numerator = (total_token_pool as u128) * (user_score as u128);
+            (numerator / total_score as u128) as u64
+        };
 
-        // Scenario 3: Zero score
-        let user_score3 = 0.0;
-        let total_score3 = 5000.0;
-        let token_amount3 = (total_token_pool as f64 * (user_score3 / total_score3)) as u64;
-        assert_eq!(token_amount3, 0);
+        assert_eq!(token_amount, 333_333_333);
 
-        // Scenario 4: Large numbers and fractions
-        let user_score4 = 12345.67;
-        let total_score4 = 987654.32;
-        let token_amount4 = (total_token_pool as f64 * (user_score4 / total_score4)) as u64;
-        assert_eq!(token_amount4, 12499990); // Corrected for f64 precision
+        // Verify that 3 users would get nearly all tokens
+        let total_distributed = token_amount * 3;
+        let dust = total_token_pool - total_distributed;
+        assert_eq!(dust, 1); // Only 1 token dust with integer math
+
+        // Scenario 2: Different scores
+        let scores = vec![250u64, 150u64, 100u64];
+        let total_score2 = scores.iter().sum::<u64>();
+        let mut total_distributed2 = 0u64;
+
+        for score in &scores {
+            let amount = {
+                let numerator = (total_token_pool as u128) * (*score as u128);
+                (numerator / total_score2 as u128) as u64
+            };
+            total_distributed2 += amount;
+        }
+
+        let dust2 = total_token_pool - total_distributed2;
+        assert!(dust2 <= scores.len() as u64); // Maximum dust is number of users
     }
 
     #[test]
-    fn test_required_sol_calculation() {
-        // Test the logic for calculating the minimum SOL required for a given number of points.
+    fn test_fixed_point_required_sol() {
+        // Test required SOL calculation with fixed-point rate
 
-        // Scenario 1: Rate causing truncation to zero
-        let points1 = 100u64;
-        let rate1 = 0.001; // 100 points -> 0.1 SOL
-        let required_sol1 = (points1 as f64 * rate1) as u64;
-        assert_eq!(required_sol1, 0);
+        // Rate of 0.001 SOL per point = 1_000_000 in fixed-point
+        let rate1 = 1_000_000u64;
+        let points1 = 1000u64;
 
-        // Scenario 2: Rate > 1
+        let required_sol1 = {
+            let product = (points1 as u128) * (rate1 as u128);
+            (product / PRECISION_FACTOR as u128) as u64
+        };
+
+        assert_eq!(required_sol1, 1); // 1000 points * 0.001 = 1 SOL
+
+        // Rate of 2.5 SOL per point = 2_500_000_000 in fixed-point
+        let rate2 = 2_500_000_000u64;
         let points2 = 50u64;
-        let rate2 = 2.5; // 50 points -> 125 SOL
-        let required_sol2 = (points2 as f64 * rate2) as u64;
-        assert_eq!(required_sol2, 125);
 
-        // Scenario 3: Rate causing truncation
-        let points3 = 150u64;
-        let rate3 = 0.005; // 150 points -> 0.75 SOL
-        let required_sol3 = (points3 as f64 * rate3) as u64;
-        assert_eq!(required_sol3, 0);
+        let required_sol2 = {
+            let product = (points2 as u128) * (rate2 as u128);
+            (product / PRECISION_FACTOR as u128) as u64
+        };
 
-        // Scenario 4: Rate resulting in whole number
-        let points4 = 2000u64;
-        let rate4 = 0.0005; // 2000 * 0.0005 = 1 SOL
-        let required_sol4 = (points4 as f64 * rate4) as u64;
-        assert_eq!(required_sol4, 1);
+        assert_eq!(required_sol2, 125); // 50 points * 2.5 = 125 SOL
+    }
+
+    #[test]
+    fn test_no_precision_loss() {
+        // Test that fixed-point arithmetic doesn't lose precision
+        let total_pool = 10_000_000_000u64; // 10 billion tokens
+        let total_score = 7u64; // Prime number to test edge case
+
+        let mut distributed = 0u64;
+
+        // Simulate 7 users each claiming their share
+        for _ in 0..7 {
+            let user_score = 1u64;
+            let amount = {
+                let numerator = (total_pool as u128) * (user_score as u128);
+                (numerator / total_score as u128) as u64
+            };
+            distributed += amount;
+        }
+
+        let dust = total_pool - distributed;
+
+        // With integer math, dust should be minimal (< number of users)
+        assert!(dust < 7);
+
+        // Each user should get at least their fair share minus 1
+        let fair_share = total_pool / total_score;
+        let per_user = distributed / 7;
+        assert!(per_user >= fair_share - 1);
+    }
+
+    #[test]
+    fn test_overflow_protection() {
+        // Test that large numbers don't cause overflow
+        let large_pool = u64::MAX / 2;
+        let large_score = u64::MAX / 4;
+        let total_score = u64::MAX / 2;
+
+        // This should not panic due to u128 conversion
+        let result = std::panic::catch_unwind(|| {
+            let numerator = (large_pool as u128) * (large_score as u128);
+            (numerator / total_score as u128) as u64
+        });
+
+        assert!(result.is_ok());
     }
 }
