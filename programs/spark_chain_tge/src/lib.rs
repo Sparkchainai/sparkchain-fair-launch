@@ -15,6 +15,7 @@ pub mod spark_chain_tge {
         commit_end_time: i64,
         rate: u64, // Now represents rate * PRECISION_FACTOR
         target_raise_sol: u64,
+        max_extension_time: i64,
     ) -> Result<()> {
         let distribution_state = &mut ctx.accounts.distribution_state;
         distribution_state.authority = ctx.accounts.authority.key();
@@ -25,6 +26,7 @@ pub mod spark_chain_tge {
         distribution_state.rate = rate; // Already scaled by PRECISION_FACTOR
         distribution_state.target_raise_sol = target_raise_sol;
         distribution_state.total_sol_raised = 0;
+        distribution_state.max_extension_time = max_extension_time;
         distribution_state.bump = ctx.bumps.distribution_state;
         Ok(())
     }
@@ -36,6 +38,12 @@ pub mod spark_chain_tge {
         require!(
             ctx.accounts.authority.key() == distribution_state.authority,
             ErrorCode::Unauthorized
+        );
+
+        // Ensure new_end_time does not exceed max_extension_time
+        require!(
+            new_end_time <= distribution_state.max_extension_time,
+            ErrorCode::ExceedsMaxExtensionTime
         );
 
         distribution_state.commit_end_time = new_end_time;
@@ -692,11 +700,12 @@ pub struct DistributionState {
     pub rate: u64,             // Conversion rate from points to sol (scaled by PRECISION_FACTOR)
     pub target_raise_sol: u64, // Target amount of sol to raise
     pub total_sol_raised: u64, // Total sol raised
+    pub max_extension_time: i64, // Maximum allowed commit end time
     pub bump: u8,              // PDA bump
 }
 
 impl DistributionState {
-    const LEN: usize = 32 + 8 + 8 + 1 + 8 + 8 + 8 + 8 + 1; // 82 bytes
+    const LEN: usize = 32 + 8 + 8 + 1 + 8 + 8 + 8 + 8 + 8 + 1; // 90 bytes
 }
 
 #[account]
@@ -831,6 +840,8 @@ pub enum ErrorCode {
     InvalidTokenAccount,
     #[msg("Calculation overflow")]
     CalculationOverflow,
+    #[msg("New end time exceeds maximum allowed extension time")]
+    ExceedsMaxExtensionTime,
 }
 
 #[cfg(test)]
@@ -937,8 +948,8 @@ mod tests {
         // This is crucial for correct on-chain space allocation.
         assert_eq!(
             DistributionState::LEN,
-            82,
-            "DistributionState::LEN is incorrect. Expected 82, got {}",
+            90,
+            "DistributionState::LEN is incorrect. Expected 90, got {}",
             DistributionState::LEN
         );
         assert_eq!(
