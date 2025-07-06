@@ -223,7 +223,6 @@ pub mod spark_chain_tge {
         backend_auth.authority = ctx.accounts.authority.key();
         backend_auth.backend_pubkey = backend_pubkey;
         backend_auth.is_active = true;
-        backend_auth.nonce_counter = 0;
 
         emit!(BackendAuthorityInitialized {
             authority: ctx.accounts.authority.key(),
@@ -249,8 +248,8 @@ pub mod spark_chain_tge {
         // Verify backend is active
         require!(backend_auth.is_active, ErrorCode::BackendInactive);
 
-        // Verify nonce is valid (must be greater than last used)
-        require!(nonce > backend_auth.nonce_counter, ErrorCode::InvalidNonce);
+        // Verify nonce is valid (must be greater than user's last used nonce)
+        require!(nonce > user_commitment.nonce_counter, ErrorCode::InvalidNonce);
 
         // Verify expiry is in the future
         require!(expiry > clock.unix_timestamp, ErrorCode::ProofExpired);
@@ -326,6 +325,7 @@ pub mod spark_chain_tge {
             .checked_add(score)
             .ok_or(ErrorCode::CalculationOverflow)?;
         user_commitment.tokens_claimed = false;
+        user_commitment.nonce_counter = nonce;
 
         // Update total score and total sol raised
         let distribution_state = &mut ctx.accounts.distribution_state;
@@ -338,9 +338,6 @@ pub mod spark_chain_tge {
             .checked_add(sol_amount)
             .ok_or(ErrorCode::CalculationOverflow)?;
 
-        // Update backend nonce counter
-        let backend_auth = &mut ctx.accounts.backend_authority;
-        backend_auth.nonce_counter = nonce;
 
         // Check if target SOL has been reached after this commitment
         if distribution_state.total_sol_raised >= distribution_state.target_raise_sol {
@@ -726,10 +723,11 @@ pub struct UserCommitment {
     pub sol_amount: u64,
     pub score: u64, // Now integer
     pub tokens_claimed: bool,
+    pub nonce_counter: u64, // User-specific nonce counter
 }
 
 impl UserCommitment {
-    const LEN: usize = 32 + 8 + 8 + 8 + 1; // 57 bytes
+    const LEN: usize = 32 + 8 + 8 + 8 + 1 + 8; // 65 bytes
 }
 
 #[account]
@@ -737,11 +735,10 @@ pub struct BackendAuthority {
     pub authority: Pubkey,      // Main program authority
     pub backend_pubkey: Pubkey, // Backend service public key
     pub is_active: bool,        // Whether backend is active
-    pub nonce_counter: u64,     // Global nonce counter
 }
 
 impl BackendAuthority {
-    const LEN: usize = 32 + 32 + 1 + 8; // 73 bytes
+    const LEN: usize = 32 + 32 + 1; // 65 bytes
 }
 
 #[event]
@@ -967,14 +964,14 @@ mod tests {
         );
         assert_eq!(
             UserCommitment::LEN,
-            57,
-            "UserCommitment::LEN is incorrect. Expected 57, got {}",
+            65,
+            "UserCommitment::LEN is incorrect. Expected 65, got {}",
             UserCommitment::LEN
         );
         assert_eq!(
             BackendAuthority::LEN,
-            73,
-            "BackendAuthority::LEN is incorrect. Expected 73, got {}",
+            65,
+            "BackendAuthority::LEN is incorrect. Expected 65, got {}",
             BackendAuthority::LEN
         );
     }
