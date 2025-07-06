@@ -7,6 +7,7 @@ mod ed25519_verify;
 
 // Fixed-point arithmetic constants
 const PRECISION_FACTOR: u64 = 1_000_000_000; // 10^9 for 9 decimal places
+const POINTS_WEIGHT: u64 = 100; // Weight multiplier for points in score calculation
 
 #[program]
 pub mod spark_chain_tge {
@@ -323,8 +324,14 @@ pub mod spark_chain_tge {
             ],
         )?;
 
-        // Score is now just the SOL amount (no decimal conversion needed)
-        let score = sol_amount;
+        // Calculate score as a weighted combination of SOL amount and points
+        // score = sol_amount + (points * POINTS_WEIGHT)
+        let points_contribution = points
+            .checked_mul(POINTS_WEIGHT)
+            .ok_or(ErrorCode::CalculationOverflow)?;
+        let score = sol_amount
+            .checked_add(points_contribution)
+            .ok_or(ErrorCode::CalculationOverflow)?;
 
         // Update user commitment
         user_commitment.user = ctx.accounts.user.key();
