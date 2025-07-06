@@ -3,6 +3,8 @@ use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 declare_id!("5FmNvJb7PpUtpfvK1iXkcBcKEDbsGQJb1s9MqWfwHyrV");
 
+mod ed25519_verify;
+
 // Fixed-point arithmetic constants
 const PRECISION_FACTOR: u64 = 1_000_000_000; // 10^9 for 9 decimal places
 
@@ -258,12 +260,20 @@ pub mod spark_chain_tge {
         let message = create_proof_message(&ctx.accounts.user.key(), points, nonce, expiry);
 
         // Verify Ed25519 signature
-        verify_ed25519_signature(
+        let signature_valid = ed25519_verify::verify_signature(
+            &backend_auth.backend_pubkey,
             &backend_signature,
             &message,
-            &backend_auth.backend_pubkey,
-            &ctx.accounts.instructions,
-        )?;
+        )
+        .map_err(|e| {
+            msg!("Ed25519 verification error: {}", e);
+            ErrorCode::Ed25519VerificationFailed
+        })?;
+        
+        if !signature_valid {
+            msg!("Ed25519 signature verification failed");
+            return Err(ErrorCode::Ed25519VerificationFailed.into());
+        }
 
         // Distribution checks
         require!(
@@ -422,116 +432,6 @@ fn create_proof_message(user: &Pubkey, points: u64, nonce: u64, expiry: i64) -> 
     message
 }
 
-fn verify_ed25519_signature(
-    signature: &[u8; 64],
-    message: &[u8],
-    pubkey: &Pubkey,
-    instructions_sysvar: &AccountInfo,
-) -> Result<()> {
-    use anchor_lang::solana_program::ed25519_program::ID as ED25519_ID;
-    use anchor_lang::solana_program::sysvar::instructions::{
-        load_current_index_checked, load_instruction_at_checked,
-    };
-
-    // Get the current instruction index
-    let current_index = load_current_index_checked(instructions_sysvar)
-        .map_err(|_| ErrorCode::Ed25519VerificationFailed)?;
-
-    // Search backwards for the Ed25519 instruction
-    let mut ed25519_ix = None;
-    for i in (0..current_index).rev() {
-        if let Ok(ix) = load_instruction_at_checked(i as usize, instructions_sysvar) {
-            if ix.program_id == ED25519_ID {
-                ed25519_ix = Some(ix);
-                break;
-            }
-        }
-    }
-
-    // Verify we found an Ed25519 instruction
-    let ed25519_ix = ed25519_ix.ok_or(ErrorCode::Ed25519VerificationFailed)?;
-
-    // Ed25519 instruction data format:
-    // - 2 bytes: Number of signatures
-    // - For each signature:
-    //   - 64 bytes: Signature
-    //   - 32 bytes: Public key
-    //   - 2 bytes: Message offset (relative to instruction data start)
-    //   - 2 bytes: Message length
-    // - Variable: Message bytes
-
-    let data = &ed25519_ix.data;
-
-    // Verify the instruction data has minimum required length
-    if data.len() < 2 {
-        msg!(
-            "Ed25519 instruction data too short: expected at least 2 bytes, got {}",
-            data.len()
-        );
-        return Err(ErrorCode::Ed25519VerificationFailed.into());
-    }
-
-    // Read number of signatures
-    let num_signatures = u16::from_le_bytes([data[0], data[1]]);
-    if num_signatures != 1 {
-        msg!("Expected 1 signature, got {}", num_signatures);
-        return Err(ErrorCode::Ed25519VerificationFailed.into());
-    }
-
-    // The web3.js Ed25519Program creates instructions in a different format:
-    // 0-1: num signatures (1)
-    // 2-15: offsets/metadata
-    // 16-47: public key (32 bytes)
-    // 48-111: signature (64 bytes)
-    // 112+: message
-
-    // Check if we have the minimum required length
-    if data.len() < 112 {
-        msg!(
-            "Ed25519 instruction data too short: expected at least 112 bytes, got {}",
-            data.len()
-        );
-        return Err(ErrorCode::Ed25519VerificationFailed.into());
-    }
-
-    // Extract components based on actual format
-    let actual_pubkey = &data[16..48];
-    let actual_signature = &data[48..112];
-    let actual_message = &data[112..];
-
-    // Verify signature matches
-    if actual_signature != signature {
-        msg!(
-            "Signature mismatch: expected {:?}, got {:?}",
-            signature,
-            actual_signature
-        );
-        return Err(ErrorCode::Ed25519VerificationFailed.into());
-    }
-
-    // Verify public key matches
-    if actual_pubkey != pubkey.as_ref() {
-        msg!(
-            "Public key mismatch: expected {:?}, got {:?}",
-            pubkey.as_ref(),
-            actual_pubkey
-        );
-        return Err(ErrorCode::Ed25519VerificationFailed.into());
-    }
-
-    // Verify message matches
-    if actual_message != message {
-        msg!(
-            "Message mismatch: expected {:?}, got {:?}",
-            message,
-            actual_message
-        );
-        return Err(ErrorCode::Ed25519VerificationFailed.into());
-    }
-
-    // If all checks pass, the Ed25519 program has already verified the signature
-    Ok(())
-}
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
@@ -680,10 +580,6 @@ pub struct CommitResources<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
     pub system_program: Program<'info, System>,
-    /// Instructions sysvar for Ed25519 verification
-    #[account(address = anchor_lang::solana_program::sysvar::instructions::ID)]
-    /// CHECK: Instructions sysvar
-    pub instructions: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
