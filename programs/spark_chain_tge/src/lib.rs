@@ -139,6 +139,9 @@ pub mod spark_chain_tge {
             (numerator / denominator) as u64
         };
 
+        // Update state before external call (Checks-Effects-Interactions pattern)
+        user_commitment.tokens_claimed = true;
+
         // Create signer seeds for PDA
         let authority_seeds = [
             b"global_distribution_state".as_ref(),
@@ -156,8 +159,6 @@ pub mod spark_chain_tge {
         let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
 
         token::transfer(cpi_ctx, token_amount)?;
-
-        user_commitment.tokens_claimed = true;
 
         emit!(TokensClaimed {
             user: ctx.accounts.user.key(),
