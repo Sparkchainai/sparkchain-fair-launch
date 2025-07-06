@@ -1,5 +1,5 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Program } from "@coral-xyz/anchor";
+import { Program, AnchorProvider } from "@coral-xyz/anchor";
 import { Connection, Keypair, SystemProgram, PublicKey } from "@solana/web3.js";
 import {
   TOKEN_PROGRAM_ID,
@@ -13,6 +13,8 @@ import {
 
 import fs from "fs";
 import path from "path";
+import { SparkChainTge } from "../target/types/spark_chain_tge";
+
 // Configuration
 const CONFIG = {
   RPC_URL: "https://api.mainnet-beta.solana.com",
@@ -37,6 +39,14 @@ const IDL = JSON.parse(
     "utf-8"
   )
 );
+
+// Fixed-point arithmetic constants
+const PRECISION_FACTOR = 1_000_000_000; // 10^9 for 9 decimal places
+
+// Helper function to convert decimal rate to fixed-point
+const toFixedPoint = (rate: number): bigint => {
+  return BigInt(Math.floor(rate * PRECISION_FACTOR));
+};
 
 async function main() {
   console.log("🚀 Starting deployment script...\n");
@@ -110,11 +120,27 @@ async function main() {
 
     // Step 5: Initialize distribution state
     console.log("\n⚡ Step 4: Initializing distribution state...");
+    const commitEndTime = Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60; // 7 days from now
+    const rate = toFixedPoint(0.001); // 0.001 SOL per point = 1_000_000 in fixed-point
+    const targetRaiseSol = 1000 * anchor.web3.LAMPORTS_PER_SOL; // 1000 SOL target
+
+    console.log(
+      "   - Commit end time:",
+      new Date(commitEndTime * 1000).toISOString()
+    );
+    console.log("   - Rate (decimal):", 0.001, "SOL per point");
+    console.log("   - Rate (fixed-point):", rate.toString());
+    console.log(
+      "   - Target raise:",
+      targetRaiseSol / anchor.web3.LAMPORTS_PER_SOL,
+      "SOL"
+    );
+
     const initializeTx = await program.methods
       .initialize(
-        new anchor.BN(CONFIG.COMMIT_END_TIME),
-        CONFIG.RATE,
-        new anchor.BN(CONFIG.TARGET_RAISE_SOL)
+        new anchor.BN(commitEndTime),
+        new anchor.BN(rate.toString()),
+        new anchor.BN(targetRaiseSol)
       )
       .accounts({
         distributionState,
@@ -242,6 +268,12 @@ async function main() {
         createVault: createVaultTx,
         fundVault: fundVaultTx,
       },
+      commitEndTime: commitEndTime,
+      rateDecimal: 0.001,
+      rateFixedPoint: rate.toString(),
+      targetRaiseSol: targetRaiseSol / anchor.web3.LAMPORTS_PER_SOL,
+      deployedAt: new Date().toISOString(),
+      precisionFactor: PRECISION_FACTOR,
     };
 
     fs.writeFileSync(

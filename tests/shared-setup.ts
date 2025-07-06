@@ -179,11 +179,18 @@ export function createBackendProof(
   return { signature, message };
 }
 
+/**
+ * @deprecated The program no longer requires Ed25519 instructions.
+ * Signatures are now verified directly in the commitResources method.
+ * This function is kept for backwards compatibility with old tests.
+ */
 export function createEd25519Instruction(
   pubkey: PublicKey,
   message: Buffer,
   signature: Uint8Array
 ) {
+  console.warn("DEPRECATED: createEd25519Instruction is no longer needed. " +
+    "The new commitResources method verifies signatures directly without requiring an Ed25519 instruction.");
   return Ed25519Program.createInstructionWithPublicKey({
     publicKey: pubkey.toBytes(),
     message: message,

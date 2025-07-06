@@ -40,6 +40,7 @@ describe("spark_chain_tge - Basic Tests", () => {
   const BACKEND_AUTHORITY_SEED = Buffer.from("backend_authority");
   const TOKEN_VAULT_SEED = Buffer.from("token_vault");
   const USER_COMMITMENT_SEED = Buffer.from("commitment");
+  const POINTS_WEIGHT = 100; // Must match the constant in the program
 
   before(async () => {
     distributionAuthority = Keypair.generate();
@@ -521,7 +522,7 @@ describe("spark_chain_tge - Basic Tests", () => {
     assert.equal(commitment.user.toString(), user.publicKey.toString());
     assert.equal(commitment.points.toString(), points.toString());
     assert.equal(commitment.solAmount.toString(), solAmount.toString());
-    assert.equal(commitment.score, solAmount.toNumber());
+    assert.equal(commitment.score, solAmount.toNumber() + points.toNumber() * POINTS_WEIGHT);
     assert.ok(commitment.tokensClaimed);
 
     // Verify state updates - check that values increased

@@ -3,6 +3,12 @@ use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 declare_id!("5FmNvJb7PpUtpfvK1iXkcBcKEDbsGQJb1s9MqWfwHyrV");
 
+mod ed25519_verify;
+
+// Fixed-point arithmetic constants
+const PRECISION_FACTOR: u64 = 1_000_000_000; // 10^9 for 9 decimal places
+const POINTS_WEIGHT: u64 = 100; // Weight multiplier for points in score calculation
+
 #[program]
 pub mod spark_chain_tge {
     use super::*;
@@ -10,18 +16,20 @@ pub mod spark_chain_tge {
     pub fn initialize(
         ctx: Context<Initialize>,
         commit_end_time: i64,
-        rate: f64,
+        rate: u64, // Now represents rate * PRECISION_FACTOR
         target_raise_sol: u64,
+        max_extension_time: i64,
     ) -> Result<()> {
         let distribution_state = &mut ctx.accounts.distribution_state;
         distribution_state.authority = ctx.accounts.authority.key();
         distribution_state.total_token_pool = 0;
-        distribution_state.total_score = 0.0;
+        distribution_state.total_score = 0; // Now integer
         distribution_state.is_active = true;
         distribution_state.commit_end_time = commit_end_time;
-        distribution_state.rate = rate;
+        distribution_state.rate = rate; // Already scaled by PRECISION_FACTOR
         distribution_state.target_raise_sol = target_raise_sol;
         distribution_state.total_sol_raised = 0;
+        distribution_state.max_extension_time = max_extension_time;
         distribution_state.bump = ctx.bumps.distribution_state;
         Ok(())
     }
@@ -33,6 +41,12 @@ pub mod spark_chain_tge {
         require!(
             ctx.accounts.authority.key() == distribution_state.authority,
             ErrorCode::Unauthorized
+        );
+
+        // Ensure new_end_time does not exceed max_extension_time
+        require!(
+            new_end_time <= distribution_state.max_extension_time,
+            ErrorCode::ExceedsMaxExtensionTime
         );
 
         distribution_state.commit_end_time = new_end_time;
@@ -97,16 +111,36 @@ pub mod spark_chain_tge {
     pub fn claim_tokens(ctx: Context<ClaimTokens>) -> Result<()> {
         let user_commitment = &mut ctx.accounts.user_commitment;
         let distribution_state = &ctx.accounts.distribution_state;
+        let clock = Clock::get()?;
 
         require!(!user_commitment.tokens_claimed, ErrorCode::AlreadyClaimed);
+        require!(distribution_state.total_score > 0, ErrorCode::NoCommitments);
+
+        // Can claim tokens if either commit period has ended OR target raise has been reached
+        let commit_period_ended = clock.unix_timestamp >= distribution_state.commit_end_time;
+        let target_reached =
+            distribution_state.total_sol_raised >= distribution_state.target_raise_sol;
+
         require!(
-            distribution_state.total_score > 0.0,
-            ErrorCode::NoCommitments
+            commit_period_ended || target_reached,
+            ErrorCode::ClaimConditionsNotMet
         );
 
-        // Calculate token allocation
-        let user_share = user_commitment.score / distribution_state.total_score;
-        let token_amount = (distribution_state.total_token_pool as f64 * user_share) as u64;
+        // Calculate token allocation using integer arithmetic
+        // token_amount = (total_token_pool * user_score) / total_score
+        // Use u128 to prevent overflow during multiplication
+        let token_amount = {
+            let numerator = (distribution_state.total_token_pool as u128)
+                .checked_mul(user_commitment.score as u128)
+                .ok_or(ErrorCode::CalculationOverflow)?;
+            let denominator = distribution_state.total_score as u128;
+
+            // Perform division and check for potential truncation
+            (numerator / denominator) as u64
+        };
+
+        // Update state before external call (Checks-Effects-Interactions pattern)
+        user_commitment.tokens_claimed = true;
 
         // Create signer seeds for PDA
         let authority_seeds = [
@@ -125,8 +159,6 @@ pub mod spark_chain_tge {
         let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
 
         token::transfer(cpi_ctx, token_amount)?;
-
-        user_commitment.tokens_claimed = true;
 
         emit!(TokensClaimed {
             user: ctx.accounts.user.key(),
@@ -175,7 +207,7 @@ pub mod spark_chain_tge {
         token::transfer(cpi_ctx, amount)?;
 
         // Update total token pool
-        distribution_state.total_token_pool = amount;
+        distribution_state.total_token_pool += amount;
 
         emit!(VaultFunded {
             authority: ctx.accounts.authority.key(),
@@ -195,7 +227,6 @@ pub mod spark_chain_tge {
         backend_auth.authority = ctx.accounts.authority.key();
         backend_auth.backend_pubkey = backend_pubkey;
         backend_auth.is_active = true;
-        backend_auth.nonce_counter = 0;
 
         emit!(BackendAuthorityInitialized {
             authority: ctx.accounts.authority.key(),
@@ -221,8 +252,8 @@ pub mod spark_chain_tge {
         // Verify backend is active
         require!(backend_auth.is_active, ErrorCode::BackendInactive);
 
-        // Verify nonce is valid (must be greater than last used)
-        require!(nonce > backend_auth.nonce_counter, ErrorCode::InvalidNonce);
+        // Verify nonce is valid (must be greater than user's last used nonce)
+        require!(nonce > user_commitment.nonce_counter, ErrorCode::InvalidNonce);
 
         // Verify expiry is in the future
         require!(expiry > clock.unix_timestamp, ErrorCode::ProofExpired);
@@ -231,12 +262,20 @@ pub mod spark_chain_tge {
         let message = create_proof_message(&ctx.accounts.user.key(), points, nonce, expiry);
 
         // Verify Ed25519 signature
-        verify_ed25519_signature(
+        let signature_valid = ed25519_verify::verify_signature(
+            &backend_auth.backend_pubkey,
             &backend_signature,
             &message,
-            &backend_auth.backend_pubkey,
-            &ctx.accounts.instructions,
-        )?;
+        )
+        .map_err(|e| {
+            msg!("Ed25519 verification error: {}", e);
+            ErrorCode::Ed25519VerificationFailed
+        })?;
+        
+        if !signature_valid {
+            msg!("Ed25519 signature verification failed");
+            return Err(ErrorCode::Ed25519VerificationFailed.into());
+        }
 
         // Distribution checks
         require!(
@@ -257,8 +296,14 @@ pub mod spark_chain_tge {
         let distribution_state_key = ctx.accounts.distribution_state.key();
         let rate = ctx.accounts.distribution_state.rate;
 
-        // Calculate required SOL amount based on points and rate
-        let required_sol = (points as f64 * rate) as u64;
+        // Calculate required SOL amount using integer arithmetic
+        // required_sol = (points * rate) / PRECISION_FACTOR
+        let required_sol = {
+            let product = (points as u128)
+                .checked_mul(rate as u128)
+                .ok_or(ErrorCode::CalculationOverflow)?;
+            (product / PRECISION_FACTOR as u128) as u64
+        };
 
         // Validate that user is committing at least the required SOL amount
         require!(
@@ -280,24 +325,37 @@ pub mod spark_chain_tge {
             ],
         )?;
 
-        // Calculate score based on SOL amount only
-        let score = sol_amount as f64;
+        // Calculate score as a weighted combination of SOL amount and points
+        // score = sol_amount + (points * POINTS_WEIGHT)
+        let points_contribution = points
+            .checked_mul(POINTS_WEIGHT)
+            .ok_or(ErrorCode::CalculationOverflow)?;
+        let score = sol_amount
+            .checked_add(points_contribution)
+            .ok_or(ErrorCode::CalculationOverflow)?;
 
         // Update user commitment
         user_commitment.user = ctx.accounts.user.key();
         user_commitment.points += points;
         user_commitment.sol_amount += sol_amount;
-        user_commitment.score += score;
+        user_commitment.score = user_commitment
+            .score
+            .checked_add(score)
+            .ok_or(ErrorCode::CalculationOverflow)?;
         user_commitment.tokens_claimed = false;
+        user_commitment.nonce_counter = nonce;
 
         // Update total score and total sol raised
         let distribution_state = &mut ctx.accounts.distribution_state;
-        distribution_state.total_score += score;
-        distribution_state.total_sol_raised += sol_amount;
+        distribution_state.total_score = distribution_state
+            .total_score
+            .checked_add(score)
+            .ok_or(ErrorCode::CalculationOverflow)?;
+        distribution_state.total_sol_raised = distribution_state
+            .total_sol_raised
+            .checked_add(sol_amount)
+            .ok_or(ErrorCode::CalculationOverflow)?;
 
-        // Update backend nonce counter
-        let backend_auth = &mut ctx.accounts.backend_authority;
-        backend_auth.nonce_counter = nonce;
 
         // Check if target SOL has been reached after this commitment
         if distribution_state.total_sol_raised >= distribution_state.target_raise_sol {
@@ -382,116 +440,6 @@ fn create_proof_message(user: &Pubkey, points: u64, nonce: u64, expiry: i64) -> 
     message
 }
 
-fn verify_ed25519_signature(
-    signature: &[u8; 64],
-    message: &[u8],
-    pubkey: &Pubkey,
-    instructions_sysvar: &AccountInfo,
-) -> Result<()> {
-    use anchor_lang::solana_program::ed25519_program::ID as ED25519_ID;
-    use anchor_lang::solana_program::sysvar::instructions::{
-        load_current_index_checked, load_instruction_at_checked,
-    };
-
-    // Get the current instruction index
-    let current_index = load_current_index_checked(instructions_sysvar)
-        .map_err(|_| ErrorCode::Ed25519VerificationFailed)?;
-
-    // Search backwards for the Ed25519 instruction
-    let mut ed25519_ix = None;
-    for i in (0..current_index).rev() {
-        if let Ok(ix) = load_instruction_at_checked(i as usize, instructions_sysvar) {
-            if ix.program_id == ED25519_ID {
-                ed25519_ix = Some(ix);
-                break;
-            }
-        }
-    }
-
-    // Verify we found an Ed25519 instruction
-    let ed25519_ix = ed25519_ix.ok_or(ErrorCode::Ed25519VerificationFailed)?;
-
-    // Ed25519 instruction data format:
-    // - 2 bytes: Number of signatures
-    // - For each signature:
-    //   - 64 bytes: Signature
-    //   - 32 bytes: Public key
-    //   - 2 bytes: Message offset (relative to instruction data start)
-    //   - 2 bytes: Message length
-    // - Variable: Message bytes
-
-    let data = &ed25519_ix.data;
-
-    // Verify the instruction data has minimum required length
-    if data.len() < 2 {
-        msg!(
-            "Ed25519 instruction data too short: expected at least 2 bytes, got {}",
-            data.len()
-        );
-        return Err(ErrorCode::Ed25519VerificationFailed.into());
-    }
-
-    // Read number of signatures
-    let num_signatures = u16::from_le_bytes([data[0], data[1]]);
-    if num_signatures != 1 {
-        msg!("Expected 1 signature, got {}", num_signatures);
-        return Err(ErrorCode::Ed25519VerificationFailed.into());
-    }
-
-    // The web3.js Ed25519Program creates instructions in a different format:
-    // 0-1: num signatures (1)
-    // 2-15: offsets/metadata
-    // 16-47: public key (32 bytes)
-    // 48-111: signature (64 bytes)
-    // 112+: message
-
-    // Check if we have the minimum required length
-    if data.len() < 112 {
-        msg!(
-            "Ed25519 instruction data too short: expected at least 112 bytes, got {}",
-            data.len()
-        );
-        return Err(ErrorCode::Ed25519VerificationFailed.into());
-    }
-
-    // Extract components based on actual format
-    let actual_pubkey = &data[16..48];
-    let actual_signature = &data[48..112];
-    let actual_message = &data[112..];
-
-    // Verify signature matches
-    if actual_signature != signature {
-        msg!(
-            "Signature mismatch: expected {:?}, got {:?}",
-            signature,
-            actual_signature
-        );
-        return Err(ErrorCode::Ed25519VerificationFailed.into());
-    }
-
-    // Verify public key matches
-    if actual_pubkey != pubkey.as_ref() {
-        msg!(
-            "Public key mismatch: expected {:?}, got {:?}",
-            pubkey.as_ref(),
-            actual_pubkey
-        );
-        return Err(ErrorCode::Ed25519VerificationFailed.into());
-    }
-
-    // Verify message matches
-    if actual_message != message {
-        msg!(
-            "Message mismatch: expected {:?}, got {:?}",
-            message,
-            actual_message
-        );
-        return Err(ErrorCode::Ed25519VerificationFailed.into());
-    }
-
-    // If all checks pass, the Ed25519 program has already verified the signature
-    Ok(())
-}
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
@@ -640,10 +588,6 @@ pub struct CommitResources<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
     pub system_program: Program<'info, System>,
-    /// Instructions sysvar for Ed25519 verification
-    #[account(address = anchor_lang::solana_program::sysvar::instructions::ID)]
-    /// CHECK: Instructions sysvar
-    pub instructions: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -662,17 +606,18 @@ pub struct UpdateBackendAuthority<'info> {
 pub struct DistributionState {
     pub authority: Pubkey,
     pub total_token_pool: u64, // Total tokens to distribute
-    pub total_score: f64,      // Total score of all users
+    pub total_score: u64,      // Total score of all users (now integer)
     pub is_active: bool,       // Active status
     pub commit_end_time: i64,  // Commit end time (unix timestamp)
-    pub rate: f64,             // Conversion rate from points to sol
+    pub rate: u64,             // Conversion rate from points to sol (scaled by PRECISION_FACTOR)
     pub target_raise_sol: u64, // Target amount of sol to raise
     pub total_sol_raised: u64, // Total sol raised
+    pub max_extension_time: i64, // Maximum allowed commit end time
     pub bump: u8,              // PDA bump
 }
 
 impl DistributionState {
-    const LEN: usize = 32 + 8 + 8 + 1 + 8 + 8 + 8 + 8 + 1; // 82 bytes
+    const LEN: usize = 32 + 8 + 8 + 1 + 8 + 8 + 8 + 8 + 8 + 1; // 90 bytes
 }
 
 #[account]
@@ -680,12 +625,13 @@ pub struct UserCommitment {
     pub user: Pubkey,
     pub points: u64,
     pub sol_amount: u64,
-    pub score: f64,
+    pub score: u64, // Now integer
     pub tokens_claimed: bool,
+    pub nonce_counter: u64, // User-specific nonce counter
 }
 
 impl UserCommitment {
-    const LEN: usize = 32 + 8 + 8 + 8 + 1;
+    const LEN: usize = 32 + 8 + 8 + 8 + 1 + 8; // 65 bytes
 }
 
 #[account]
@@ -693,11 +639,10 @@ pub struct BackendAuthority {
     pub authority: Pubkey,      // Main program authority
     pub backend_pubkey: Pubkey, // Backend service public key
     pub is_active: bool,        // Whether backend is active
-    pub nonce_counter: u64,     // Global nonce counter
 }
 
 impl BackendAuthority {
-    const LEN: usize = 32 + 32 + 1 + 8; // 73 bytes
+    const LEN: usize = 32 + 32 + 1; // 65 bytes
 }
 
 #[event]
@@ -705,7 +650,7 @@ pub struct ResourcesCommitted {
     pub user: Pubkey,
     pub points: u64,
     pub sol_amount: u64,
-    pub score: f64,
+    pub score: u64, // Now integer
     pub proof_nonce: u64,
     pub backend_signature: [u8; 64],
     pub expiry: i64,
@@ -792,6 +737,8 @@ pub enum ErrorCode {
     InsufficientSolCommitment,
     #[msg("Withdraw conditions not met - commit period must end or target raise must be reached")]
     WithdrawConditionsNotMet,
+    #[msg("Claim conditions not met - commit period must end or target raise must be reached")]
+    ClaimConditionsNotMet,
     // Hybrid Approach Errors
     #[msg("Backend is inactive")]
     BackendInactive,
@@ -805,6 +752,10 @@ pub enum ErrorCode {
     Ed25519VerificationFailed,
     #[msg("Invalid token account")]
     InvalidTokenAccount,
+    #[msg("Calculation overflow")]
+    CalculationOverflow,
+    #[msg("New end time exceeds maximum allowed extension time")]
+    ExceedsMaxExtensionTime,
 }
 
 #[cfg(test)]
@@ -911,20 +862,20 @@ mod tests {
         // This is crucial for correct on-chain space allocation.
         assert_eq!(
             DistributionState::LEN,
-            82,
-            "DistributionState::LEN is incorrect. Expected 82, got {}",
+            90,
+            "DistributionState::LEN is incorrect. Expected 90, got {}",
             DistributionState::LEN
         );
         assert_eq!(
             UserCommitment::LEN,
-            57,
-            "UserCommitment::LEN is incorrect. Expected 57, got {}",
+            65,
+            "UserCommitment::LEN is incorrect. Expected 65, got {}",
             UserCommitment::LEN
         );
         assert_eq!(
             BackendAuthority::LEN,
-            73,
-            "BackendAuthority::LEN is incorrect. Expected 73, got {}",
+            65,
+            "BackendAuthority::LEN is incorrect. Expected 65, got {}",
             BackendAuthority::LEN
         );
     }
@@ -954,61 +905,113 @@ mod tests {
     }
 
     #[test]
-    fn test_token_allocation_logic() {
-        // Test the core logic for calculating a user's token share.
+    fn test_fixed_point_token_allocation() {
+        // Test the fixed-point arithmetic for token allocation
         let total_token_pool = 1_000_000_000u64;
 
-        // Scenario 1: Simple case
-        let user_score1 = 500.0;
-        let total_score1 = 2000.0;
-        let token_amount1 = (total_token_pool as f64 * (user_score1 / total_score1)) as u64;
-        assert_eq!(token_amount1, 250_000_000);
+        // Scenario 1: Simple case - 3 equal users
+        let user_score = 100u64;
+        let total_score = 300u64;
 
-        // Scenario 2: User has all the score
-        let user_score2 = 1000.0;
-        let total_score2 = 1000.0;
-        let token_amount2 = (total_token_pool as f64 * (user_score2 / total_score2)) as u64;
-        assert_eq!(token_amount2, 1_000_000_000);
+        // Calculate using u128 to prevent overflow
+        let token_amount = {
+            let numerator = (total_token_pool as u128) * (user_score as u128);
+            (numerator / total_score as u128) as u64
+        };
 
-        // Scenario 3: Zero score
-        let user_score3 = 0.0;
-        let total_score3 = 5000.0;
-        let token_amount3 = (total_token_pool as f64 * (user_score3 / total_score3)) as u64;
-        assert_eq!(token_amount3, 0);
+        assert_eq!(token_amount, 333_333_333);
 
-        // Scenario 4: Large numbers and fractions
-        let user_score4 = 12345.67;
-        let total_score4 = 987654.32;
-        let token_amount4 = (total_token_pool as f64 * (user_score4 / total_score4)) as u64;
-        assert_eq!(token_amount4, 12499990); // Corrected for f64 precision
+        // Verify that 3 users would get nearly all tokens
+        let total_distributed = token_amount * 3;
+        let dust = total_token_pool - total_distributed;
+        assert_eq!(dust, 1); // Only 1 token dust with integer math
+
+        // Scenario 2: Different scores
+        let scores = vec![250u64, 150u64, 100u64];
+        let total_score2 = scores.iter().sum::<u64>();
+        let mut total_distributed2 = 0u64;
+
+        for score in &scores {
+            let amount = {
+                let numerator = (total_token_pool as u128) * (*score as u128);
+                (numerator / total_score2 as u128) as u64
+            };
+            total_distributed2 += amount;
+        }
+
+        let dust2 = total_token_pool - total_distributed2;
+        assert!(dust2 <= scores.len() as u64); // Maximum dust is number of users
     }
 
     #[test]
-    fn test_required_sol_calculation() {
-        // Test the logic for calculating the minimum SOL required for a given number of points.
+    fn test_fixed_point_required_sol() {
+        // Test required SOL calculation with fixed-point rate
 
-        // Scenario 1: Rate causing truncation to zero
-        let points1 = 100u64;
-        let rate1 = 0.001; // 100 points -> 0.1 SOL
-        let required_sol1 = (points1 as f64 * rate1) as u64;
-        assert_eq!(required_sol1, 0);
+        // Rate of 0.001 SOL per point = 1_000_000 in fixed-point
+        let rate1 = 1_000_000u64;
+        let points1 = 1000u64;
 
-        // Scenario 2: Rate > 1
+        let required_sol1 = {
+            let product = (points1 as u128) * (rate1 as u128);
+            (product / PRECISION_FACTOR as u128) as u64
+        };
+
+        assert_eq!(required_sol1, 1); // 1000 points * 0.001 = 1 SOL
+
+        // Rate of 2.5 SOL per point = 2_500_000_000 in fixed-point
+        let rate2 = 2_500_000_000u64;
         let points2 = 50u64;
-        let rate2 = 2.5; // 50 points -> 125 SOL
-        let required_sol2 = (points2 as f64 * rate2) as u64;
-        assert_eq!(required_sol2, 125);
 
-        // Scenario 3: Rate causing truncation
-        let points3 = 150u64;
-        let rate3 = 0.005; // 150 points -> 0.75 SOL
-        let required_sol3 = (points3 as f64 * rate3) as u64;
-        assert_eq!(required_sol3, 0);
+        let required_sol2 = {
+            let product = (points2 as u128) * (rate2 as u128);
+            (product / PRECISION_FACTOR as u128) as u64
+        };
 
-        // Scenario 4: Rate resulting in whole number
-        let points4 = 2000u64;
-        let rate4 = 0.0005; // 2000 * 0.0005 = 1 SOL
-        let required_sol4 = (points4 as f64 * rate4) as u64;
-        assert_eq!(required_sol4, 1);
+        assert_eq!(required_sol2, 125); // 50 points * 2.5 = 125 SOL
+    }
+
+    #[test]
+    fn test_no_precision_loss() {
+        // Test that fixed-point arithmetic doesn't lose precision
+        let total_pool = 10_000_000_000u64; // 10 billion tokens
+        let total_score = 7u64; // Prime number to test edge case
+
+        let mut distributed = 0u64;
+
+        // Simulate 7 users each claiming their share
+        for _ in 0..7 {
+            let user_score = 1u64;
+            let amount = {
+                let numerator = (total_pool as u128) * (user_score as u128);
+                (numerator / total_score as u128) as u64
+            };
+            distributed += amount;
+        }
+
+        let dust = total_pool - distributed;
+
+        // With integer math, dust should be minimal (< number of users)
+        assert!(dust < 7);
+
+        // Each user should get at least their fair share minus 1
+        let fair_share = total_pool / total_score;
+        let per_user = distributed / 7;
+        assert!(per_user >= fair_share - 1);
+    }
+
+    #[test]
+    fn test_overflow_protection() {
+        // Test that large numbers don't cause overflow
+        let large_pool = u64::MAX / 2;
+        let large_score = u64::MAX / 4;
+        let total_score = u64::MAX / 2;
+
+        // This should not panic due to u128 conversion
+        let result = std::panic::catch_unwind(|| {
+            let numerator = (large_pool as u128) * (large_score as u128);
+            (numerator / total_score as u128) as u64
+        });
+
+        assert!(result.is_ok());
     }
 }
