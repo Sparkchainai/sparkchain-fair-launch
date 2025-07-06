@@ -203,7 +203,7 @@ pub mod spark_chain_tge {
         token::transfer(cpi_ctx, amount)?;
 
         // Update total token pool
-        distribution_state.total_token_pool = amount;
+        distribution_state.total_token_pool += amount;
 
         emit!(VaultFunded {
             authority: ctx.accounts.authority.key(),
